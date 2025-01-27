@@ -653,6 +653,15 @@ func WrapErrResourceGroupIllegalConfig(rg any, cfg any, msg ...string) error {
 	return err
 }
 
+// WrapErrStreamingNodeNotEnough make a streaming node is not enough error
+func WrapErrStreamingNodeNotEnough(current int, expected int, msg ...string) error {
+	err := wrapFields(ErrServiceResourceInsufficient, value("currentStreamingNode", current), value("expectedStreamingNode", expected))
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
 // go:deprecated
 // WrapErrResourceGroupNodeNotEnough wraps ErrResourceGroupNodeNotEnough with resource group
 func WrapErrResourceGroupNodeNotEnough(rg any, current any, expected any, msg ...string) error {
@@ -983,6 +992,14 @@ func WrapErrMqTopicNotEmpty(name string, msg ...string) error {
 
 func WrapErrMqInternal(err error, msg ...string) error {
 	err = wrapFieldsWithDesc(ErrMqInternal, err.Error())
+	if len(msg) > 0 {
+		err = errors.Wrap(err, strings.Join(msg, "->"))
+	}
+	return err
+}
+
+func WrapErrTooManyConsumers(vchannel string, msg ...string) error {
+	err := wrapFields(ErrTooManyConsumers, value("vchannel", vchannel))
 	if len(msg) > 0 {
 		err = errors.Wrap(err, strings.Join(msg, "->"))
 	}

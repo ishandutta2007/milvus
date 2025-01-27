@@ -81,6 +81,11 @@ const (
 	InvalidNodeID = int64(-1)
 )
 
+const (
+	MinimalScalarIndexEngineVersion = int32(0)
+	CurrentScalarIndexEngineVersion = int32(1)
+)
+
 // Endian is type alias of binary.LittleEndian.
 // Milvus uses little endian by default.
 var Endian = binary.LittleEndian
@@ -424,4 +429,16 @@ func GetReplicateEndTS(kvs []*commonpb.KeyValuePair) (uint64, bool) {
 		}
 	}
 	return 0, false
+}
+
+func ValidateAutoIndexMmapConfig(autoIndexConfigEnable, isVectorField bool, indexParams map[string]string) error {
+	if !autoIndexConfigEnable {
+		return nil
+	}
+
+	_, ok := indexParams[MmapEnabledKey]
+	if ok && isVectorField {
+		return fmt.Errorf("mmap index is not supported to config for the collection in auto index mode")
+	}
+	return nil
 }

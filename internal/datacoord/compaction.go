@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
-	"go.opentelemetry.io/otel"
 	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
@@ -441,10 +440,11 @@ func (c *compactionPlanHandler) loadMeta() {
 }
 
 func (c *compactionPlanHandler) loopSchedule() {
-	log.Info("compactionPlanHandler start loop schedule")
+	interval := paramtable.Get().DataCoordCfg.CompactionScheduleInterval.GetAsDuration(time.Millisecond)
+	log.Info("compactionPlanHandler start loop schedule", zap.Duration("schedule interval", interval))
 	defer c.stopWg.Done()
 
-	scheduleTicker := time.NewTicker(3 * time.Second)
+	scheduleTicker := time.NewTicker(interval)
 	defer scheduleTicker.Stop()
 	for {
 		select {
@@ -592,8 +592,6 @@ func (c *compactionPlanHandler) removeTasksByChannel(channel string) {
 }
 
 func (c *compactionPlanHandler) submitTask(t CompactionTask) error {
-	_, span := otel.Tracer(typeutil.DataCoordRole).Start(context.Background(), fmt.Sprintf("Compaction-%s", t.GetTaskProto().GetType()))
-	t.SetSpan(span)
 	if err := c.queueTasks.Enqueue(t); err != nil {
 		return err
 	}
@@ -603,8 +601,6 @@ func (c *compactionPlanHandler) submitTask(t CompactionTask) error {
 
 // restoreTask used to restore Task from etcd
 func (c *compactionPlanHandler) restoreTask(t CompactionTask) {
-	_, span := otel.Tracer(typeutil.DataCoordRole).Start(context.Background(), fmt.Sprintf("Compaction-%s", t.GetTaskProto().GetType()))
-	t.SetSpan(span)
 	c.executingGuard.Lock()
 	c.executingTasks[t.GetTaskProto().GetPlanID()] = t
 	c.executingGuard.Unlock()
