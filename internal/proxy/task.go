@@ -55,6 +55,7 @@ const (
 	IgnoreGrowingKey     = "ignore_growing"
 	ReduceStopForBestKey = "reduce_stop_for_best"
 	IteratorField        = "iterator"
+	CollectionID         = "collection_id"
 	GroupByFieldKey      = "group_by_field"
 	GroupSizeKey         = "group_size"
 	StrictGroupSize      = "strict_group_size"
@@ -370,7 +371,7 @@ func (t *createCollectionTask) PreExecute(ctx context.Context) error {
 		return err
 	}
 
-	hasPartitionKey := hasParitionKeyModeField(t.schema)
+	hasPartitionKey := hasPartitionKeyModeField(t.schema)
 	if _, err := validatePartitionKeyIsolation(ctx, t.CollectionName, hasPartitionKey, t.GetProperties()...); err != nil {
 		return err
 	}
@@ -396,6 +397,7 @@ func (t *createCollectionTask) PreExecute(ctx context.Context) error {
 		// valid max length per row parameters
 		// if max_length not specified, return error
 		if field.DataType == schemapb.DataType_VarChar ||
+			field.DataType == schemapb.DataType_Text ||
 			(field.GetDataType() == schemapb.DataType_Array && field.GetElementType() == schemapb.DataType_VarChar) {
 			err = validateMaxLengthPerRow(t.schema.Name, field)
 			if err != nil {
@@ -703,6 +705,7 @@ func (t *describeCollectionTask) Execute(ctx context.Context) error {
 	t.result.Properties = result.Properties
 	t.result.DbName = result.GetDbName()
 	t.result.NumPartitions = result.NumPartitions
+	t.result.UpdateTimestamp = result.UpdateTimestamp
 	for _, field := range result.Schema.Fields {
 		if field.IsDynamic {
 			continue
@@ -2744,4 +2747,18 @@ func (t *ListResourceGroupsTask) Execute(ctx context.Context) error {
 
 func (t *ListResourceGroupsTask) PostExecute(ctx context.Context) error {
 	return nil
+}
+
+// isIgnoreGrowing is used to check if the request should ignore growing
+func isIgnoreGrowing(params []*commonpb.KeyValuePair) (bool, error) {
+	for _, kv := range params {
+		if kv.GetKey() == IgnoreGrowingKey {
+			ignoreGrowing, err := strconv.ParseBool(kv.GetValue())
+			if err != nil {
+				return false, errors.New("parse ignore growing field failed")
+			}
+			return ignoreGrowing, nil
+		}
+	}
+	return false, nil
 }

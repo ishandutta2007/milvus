@@ -64,7 +64,7 @@ import (
 type ServiceSuite struct {
 	suite.Suite
 	// Data
-	msgChan        chan *msgstream.MsgPack
+	msgChan        chan *msgstream.ConsumeMsgPack
 	collectionID   int64
 	collectionName string
 	schema         *schemapb.CollectionSchema
@@ -380,6 +380,69 @@ func (suite *ServiceSuite) TestWatchDmChannelsVarchar() {
 	suite.Equal(commonpb.ErrorCode_Success, status.ErrorCode)
 }
 
+func (suite *ServiceSuite) TestWatchDmChannels_BadIndexMeta() {
+	ctx := context.Background()
+
+	// data
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_Int64, false)
+	deltaLogs, err := mock_segcore.SaveDeltaLog(suite.collectionID,
+		suite.partitionIDs[0],
+		suite.flushedSegmentIDs[0],
+		suite.node.chunkManager,
+	)
+	suite.NoError(err)
+
+	req := &querypb.WatchDmChannelsRequest{
+		Base: &commonpb.MsgBase{
+			MsgType:  commonpb.MsgType_WatchDmChannels,
+			MsgID:    rand.Int63(),
+			TargetID: suite.node.session.ServerID,
+		},
+		NodeID:       suite.node.session.ServerID,
+		CollectionID: suite.collectionID,
+		PartitionIDs: suite.partitionIDs,
+		Infos: []*datapb.VchannelInfo{
+			{
+				CollectionID:        suite.collectionID,
+				ChannelName:         suite.vchannel,
+				SeekPosition:        suite.position,
+				FlushedSegmentIds:   suite.flushedSegmentIDs,
+				DroppedSegmentIds:   suite.droppedSegmentIDs,
+				LevelZeroSegmentIds: suite.levelZeroSegmentIDs,
+			},
+		},
+		SegmentInfos: map[int64]*datapb.SegmentInfo{
+			suite.levelZeroSegmentIDs[0]: {
+				ID:            suite.levelZeroSegmentIDs[0],
+				CollectionID:  suite.collectionID,
+				PartitionID:   suite.partitionIDs[0],
+				InsertChannel: suite.vchannel,
+				Deltalogs:     deltaLogs,
+				Level:         datapb.SegmentLevel_L0,
+			},
+		},
+		Schema: schema,
+		LoadMeta: &querypb.LoadMetaInfo{
+			LoadType:     querypb.LoadType_LoadCollection,
+			CollectionID: suite.collectionID,
+			PartitionIDs: suite.partitionIDs,
+			MetricType:   defaultMetricType,
+		},
+		IndexInfoList: []*indexpb.IndexInfo{{
+			IndexName: "bad_index",
+			FieldID:   100,
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: "dup_key", Value: "val"},
+				{Key: "dup_key", Value: "val"},
+			},
+		}},
+	}
+
+	// watchDmChannels
+	status, err := suite.node.WatchDmChannels(ctx, req)
+	suite.Error(merr.CheckRPCCall(status, err))
+}
+
 func (suite *ServiceSuite) TestWatchDmChannels_Failed() {
 	ctx := context.Background()
 
@@ -483,10 +546,8 @@ func (suite *ServiceSuite) TestUnsubDmChannels_Normal() {
 	l0Segment := segments.NewMockSegment(suite.T())
 	l0Segment.EXPECT().ID().Return(10000)
 	l0Segment.EXPECT().Collection().Return(suite.collectionID)
-	l0Segment.EXPECT().Partition().Return(common.AllPartitionsID)
 	l0Segment.EXPECT().Level().Return(datapb.SegmentLevel_L0)
 	l0Segment.EXPECT().Type().Return(commonpb.SegmentState_Sealed)
-	l0Segment.EXPECT().Indexes().Return(nil)
 	l0Segment.EXPECT().Shard().Return(suite.channel)
 	l0Segment.EXPECT().Release(ctx).Return()
 
@@ -655,6 +716,49 @@ func (suite *ServiceSuite) TestLoadSegments_VarChar() {
 		status, err := suite.node.LoadSegments(ctx, req)
 		suite.NoError(err)
 		suite.Equal(commonpb.ErrorCode_Success, status.GetErrorCode())
+	}
+}
+
+func (suite *ServiceSuite) TestLoadSegments_BadIndexMeta() {
+	ctx := context.Background()
+	suite.TestWatchDmChannelsVarchar()
+	// data
+	schema := mock_segcore.GenTestCollectionSchema(suite.collectionName, schemapb.DataType_VarChar, false)
+	loadMeta := &querypb.LoadMetaInfo{
+		LoadType:     querypb.LoadType_LoadCollection,
+		CollectionID: suite.collectionID,
+		PartitionIDs: suite.partitionIDs,
+	}
+	suite.node.manager.Collection = segments.NewCollectionManager()
+	// suite.node.manager.Collection.PutOrRef(suite.collectionID, schema, nil, loadMeta)
+
+	infos := suite.genSegmentLoadInfos(schema, nil)
+	for _, info := range infos {
+		req := &querypb.LoadSegmentsRequest{
+			Base: &commonpb.MsgBase{
+				MsgID:    rand.Int63(),
+				TargetID: suite.node.session.ServerID,
+			},
+			CollectionID:   suite.collectionID,
+			DstNodeID:      suite.node.session.ServerID,
+			Infos:          []*querypb.SegmentLoadInfo{info},
+			Schema:         schema,
+			DeltaPositions: []*msgpb.MsgPosition{{Timestamp: 20000}},
+			NeedTransfer:   true,
+			LoadMeta:       loadMeta,
+			IndexInfoList: []*indexpb.IndexInfo{{
+				IndexName: "bad_index",
+				FieldID:   100,
+				TypeParams: []*commonpb.KeyValuePair{
+					{Key: "dup_key", Value: "val"},
+					{Key: "dup_key", Value: "val"},
+				},
+			}},
+		}
+
+		// LoadSegment
+		status, err := suite.node.LoadSegments(ctx, req)
+		suite.Error(merr.CheckRPCCall(status, err))
 	}
 }
 

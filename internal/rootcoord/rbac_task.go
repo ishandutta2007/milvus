@@ -148,16 +148,14 @@ func executeOperatePrivilegeTaskSteps(ctx context.Context, core *Core, in *milvu
 	privName := in.Entity.Grantor.Privilege.Name
 	redoTask := newBaseRedoTask(core.stepExecutor)
 	redoTask.AddSyncStep(NewSimpleStep("operate privilege meta data", func(ctx context.Context) ([]nestedStep, error) {
-		if !util.IsAnyWord(privName) {
-			// set up privilege name for metastore
-			dbPrivName, err := core.getMetastorePrivilegeName(ctx, privName)
-			if err != nil {
-				return nil, err
-			}
-			in.Entity.Grantor.Privilege.Name = dbPrivName
+		// set up privilege name for metastore
+		dbPrivName, err := core.getMetastorePrivilegeName(ctx, privName)
+		if err != nil {
+			return nil, err
 		}
+		in.Entity.Grantor.Privilege.Name = dbPrivName
 
-		err := core.meta.OperatePrivilege(ctx, util.DefaultTenant, in.Entity, in.Type)
+		err = core.meta.OperatePrivilege(ctx, util.DefaultTenant, in.Entity, in.Type)
 		if err != nil && !common.IsIgnorableError(err) {
 			log.Ctx(ctx).Warn("fail to operate the privilege", zap.Any("in", in), zap.Error(err))
 			return nil, err
@@ -209,12 +207,14 @@ func executeOperatePrivilegeTaskSteps(ctx context.Context, core *Core, in *milvu
 				})
 			})
 		}
-		if err := core.proxyClientManager.RefreshPolicyInfoCache(ctx, &proxypb.RefreshPolicyInfoCacheRequest{
-			OpType: opType,
-			OpKey:  funcutil.PolicyForPrivileges(expandGrants),
-		}); err != nil {
-			log.Ctx(ctx).Warn("fail to refresh policy info cache", zap.Any("in", in), zap.Error(err))
-			return nil, err
+		if len(expandGrants) > 0 {
+			if err := core.proxyClientManager.RefreshPolicyInfoCache(ctx, &proxypb.RefreshPolicyInfoCacheRequest{
+				OpType: opType,
+				OpKey:  funcutil.PolicyForPrivileges(expandGrants),
+			}); err != nil {
+				log.Ctx(ctx).Warn("fail to refresh policy info cache", zap.Any("in", in), zap.Error(err))
+				return nil, err
+			}
 		}
 		return nil, nil
 	}))

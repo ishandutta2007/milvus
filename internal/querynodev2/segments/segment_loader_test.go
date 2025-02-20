@@ -678,7 +678,7 @@ func (suite *SegmentLoaderSuite) TestPatchEntryNum() {
 	info := segment.GetIndex(vecFields[0])
 	suite.Require().NotNil(info)
 
-	for _, binlog := range info.FieldBinlog.GetBinlogs() {
+	for _, binlog := range info[0].FieldBinlog.GetBinlogs() {
 		suite.Greater(binlog.EntriesNum, int64(0))
 	}
 }
@@ -811,7 +811,8 @@ func (suite *SegmentLoaderDetailSuite) SetupTest() {
 		PartitionIDs: []int64{suite.partitionID},
 	}
 
-	collection := NewCollection(suite.collectionID, schema, indexMeta, loadMeta)
+	collection, err := NewCollection(suite.collectionID, schema, indexMeta, loadMeta)
+	suite.Require().NoError(err)
 	suite.collectionManager.EXPECT().Get(suite.collectionID).Return(collection).Maybe()
 }
 

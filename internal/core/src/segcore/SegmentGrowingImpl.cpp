@@ -185,9 +185,6 @@ SegmentGrowingImpl::Insert(int64_t reserved_offset,
 
 void
 SegmentGrowingImpl::LoadFieldData(const LoadFieldDataInfo& infos) {
-    // schema don't include system field
-    AssertInfo(infos.field_infos.size() == schema_->size(),
-               "lost some field data when load for growing segment");
     AssertInfo(infos.field_infos.find(TimestampFieldID.get()) !=
                    infos.field_infos.end(),
                "timestamps field data should be included");
@@ -486,6 +483,14 @@ SegmentGrowingImpl::bulk_subscript(FieldId field_id,
                 result->mutable_vectors()->mutable_sparse_float_vector());
             result->mutable_vectors()->set_dim(
                 result->vectors().sparse_float_vector().dim());
+        } else if (field_meta.get_data_type() == DataType::VECTOR_INT8) {
+            bulk_subscript_impl<Int8Vector>(
+                field_id,
+                field_meta.get_sizeof(),
+                vec_ptr,
+                seg_offsets,
+                count,
+                result->mutable_vectors()->mutable_int8_vector()->data());
         } else {
             PanicInfo(DataTypeInvalid, "logical error");
         }
@@ -574,7 +579,8 @@ SegmentGrowingImpl::bulk_subscript(FieldId field_id,
                                             ->mutable_data());
             break;
         }
-        case DataType::VARCHAR: {
+        case DataType::VARCHAR:
+        case DataType::TEXT: {
             bulk_subscript_ptr_impl<std::string>(vec_ptr,
                                                  seg_offsets,
                                                  count,

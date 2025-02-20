@@ -33,17 +33,17 @@ import (
 func generateTestSchema() *schemapb.CollectionSchema {
 	schema := &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{
 		{FieldID: common.TimeStampField, Name: "ts", DataType: schemapb.DataType_Int64},
-		{FieldID: common.RowIDField, Name: "rowid", DataType: schemapb.DataType_Int64},
+		{FieldID: common.RowIDField, Name: "rowid", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
 		{FieldID: 10, Name: "bool", DataType: schemapb.DataType_Bool},
 		{FieldID: 11, Name: "int8", DataType: schemapb.DataType_Int8},
 		{FieldID: 12, Name: "int16", DataType: schemapb.DataType_Int16},
 		{FieldID: 13, Name: "int64", DataType: schemapb.DataType_Int64},
 		{FieldID: 14, Name: "float", DataType: schemapb.DataType_Float},
 		{FieldID: 15, Name: "double", DataType: schemapb.DataType_Double},
-		{FieldID: 16, Name: "varchar", DataType: schemapb.DataType_VarChar, IsPrimaryKey: true},
+		{FieldID: 16, Name: "varchar", DataType: schemapb.DataType_VarChar},
 		{FieldID: 17, Name: "string", DataType: schemapb.DataType_String},
 		{FieldID: 18, Name: "array", DataType: schemapb.DataType_Array},
-		{FieldID: 19, Name: "string", DataType: schemapb.DataType_JSON},
+		{FieldID: 19, Name: "json", DataType: schemapb.DataType_JSON},
 		{FieldID: 101, Name: "int32", DataType: schemapb.DataType_Int32},
 		{FieldID: 102, Name: "floatVector", DataType: schemapb.DataType_FloatVector, TypeParams: []*commonpb.KeyValuePair{
 			{Key: common.DimKey, Value: "8"},
@@ -66,6 +66,10 @@ func generateTestSchema() *schemapb.CollectionSchema {
 }
 
 func generateTestData(num int) ([]*Blob, error) {
+	return generateTestDataWithSeed(1, num)
+}
+
+func generateTestDataWithSeed(seed, num int) ([]*Blob, error) {
 	insertCodec := NewInsertCodecWithSchema(&etcdpb.CollectionMeta{ID: 1, Schema: generateTestSchema()})
 
 	var (
@@ -92,7 +96,7 @@ func generateTestData(num int) ([]*Blob, error) {
 		field106 [][]byte
 	)
 
-	for i := 1; i <= num; i++ {
+	for i := seed; i < seed+num; i++ {
 		field0 = append(field0, int64(i))
 		field1 = append(field1, int64(i))
 		field10 = append(field10, true)
@@ -277,82 +281,5 @@ func TestInsertlogIterator(t *testing.T) {
 		assert.False(t, itr.HasNext())
 		_, err = itr.Next()
 		assert.Equal(t, ErrNoMoreRecord, err)
-	})
-}
-
-func TestMergeIterator(t *testing.T) {
-	t.Run("empty iterators", func(t *testing.T) {
-		iterators := make([]Iterator, 0)
-		for i := 0; i < 3; i++ {
-			iterators = append(iterators, &InsertBinlogIterator{
-				data: &InsertData{},
-			})
-		}
-		itr := NewMergeIterator(iterators)
-		assert.False(t, itr.HasNext())
-		_, err := itr.Next()
-		assert.Equal(t, ErrNoMoreRecord, err)
-	})
-
-	t.Run("empty and non-empty iterators", func(t *testing.T) {
-		blobs, err := generateTestData(3)
-		assert.NoError(t, err)
-		insertItr, err := NewInsertBinlogIterator(blobs, common.RowIDField, schemapb.DataType_Int64)
-		assert.NoError(t, err)
-		iterators := []Iterator{
-			&InsertBinlogIterator{data: &InsertData{}},
-			insertItr,
-		}
-
-		itr := NewMergeIterator(iterators)
-
-		for i := 1; i <= 3; i++ {
-			assert.True(t, itr.HasNext())
-			v, err := itr.Next()
-			assert.NoError(t, err)
-			value := v.(*Value)
-			assertTestDataInternal(t, i, value, false)
-		}
-		assert.False(t, itr.HasNext())
-		_, err = itr.Next()
-		assert.Equal(t, ErrNoMoreRecord, err)
-	})
-
-	t.Run("non-empty iterators", func(t *testing.T) {
-		blobs, err := generateTestData(3)
-		assert.NoError(t, err)
-		itr1, err := NewInsertBinlogIterator(blobs, common.RowIDField, schemapb.DataType_Int64)
-		assert.NoError(t, err)
-		itr2, err := NewInsertBinlogIterator(blobs, common.RowIDField, schemapb.DataType_Int64)
-		assert.NoError(t, err)
-		iterators := []Iterator{itr1, itr2}
-		itr := NewMergeIterator(iterators)
-
-		for i := 1; i <= 3; i++ {
-			for j := 0; j < 2; j++ {
-				assert.True(t, itr.HasNext())
-				v, err := itr.Next()
-				assert.NoError(t, err)
-				value := v.(*Value)
-				assertTestDataInternal(t, i, value, false)
-			}
-		}
-
-		assert.False(t, itr.HasNext())
-		_, err = itr.Next()
-		assert.Equal(t, ErrNoMoreRecord, err)
-	})
-
-	t.Run("test dispose", func(t *testing.T) {
-		blobs, err := generateTestData(3)
-		assert.NoError(t, err)
-		itr1, err := NewInsertBinlogIterator(blobs, common.RowIDField, schemapb.DataType_Int64)
-		assert.NoError(t, err)
-		itr := NewMergeIterator([]Iterator{itr1})
-
-		itr.Dispose()
-		assert.False(t, itr.HasNext())
-		_, err = itr.Next()
-		assert.Equal(t, ErrDisposed, err)
 	})
 }

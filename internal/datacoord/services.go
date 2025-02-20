@@ -571,6 +571,8 @@ func (s *Server) SaveBinlogPaths(ctx context.Context, req *datapb.SaveBinlogPath
 
 	if req.GetSegLevel() == datapb.SegmentLevel_L0 {
 		metrics.DataCoordSizeStoredL0Segment.WithLabelValues(fmt.Sprint(req.GetCollectionID())).Observe(calculateL0SegmentSize(req.GetField2StatslogPaths()))
+
+		s.compactionTriggerManager.OnCollectionUpdate(req.GetCollectionID())
 		return merr.Success(), nil
 	}
 
@@ -610,6 +612,13 @@ func (s *Server) DropVirtualChannel(ctx context.Context, req *datapb.DropVirtual
 	// validate
 	nodeID := req.GetBase().GetSourceID()
 	if !s.channelManager.Match(nodeID, channel) {
+		if streamingutil.IsStreamingServiceEnabled() {
+			// If streaming service is enabled, the channel manager will always return true if channel exist.
+			// once the channel is not exist, the drop virtual channel has been done.
+			return &datapb.DropVirtualChannelResponse{
+				Status: merr.Success(),
+			}, nil
+		}
 		err := merr.WrapErrChannelNotFound(channel, fmt.Sprintf("for node %d", nodeID))
 		resp.Status = merr.Status(err)
 		log.Warn("node is not matched with channel", zap.String("channel", channel), zap.Int64("nodeID", nodeID))
@@ -686,6 +695,12 @@ func (s *Server) GetStateCode() commonpb.StateCode {
 		return commonpb.StateCode_Abnormal
 	}
 	return code.(commonpb.StateCode)
+}
+
+// UpdateStateCode update state code
+func (s *Server) UpdateStateCode(code commonpb.StateCode) {
+	s.stateCode.Store(code)
+	log.Ctx(s.ctx).Info("update datacoord state", zap.String("state", code.String()))
 }
 
 // GetComponentStates returns DataCoord's current state
@@ -1440,6 +1455,13 @@ func (s *Server) UpdateChannelCheckpoint(ctx context.Context, req *datapb.Update
 		return merr.Status(err), nil
 	}
 
+	for _, pos := range checkpoints {
+		if pos == nil || pos.GetMsgID() == nil || pos.GetChannelName() == "" {
+			continue
+		}
+		s.segmentManager.CleanZeroSealedSegmentsOfChannel(ctx, pos.GetChannelName(), pos.GetTimestamp())
+	}
+
 	return merr.Success(), nil
 }
 
@@ -1700,19 +1722,28 @@ func (s *Server) ImportV2(ctx context.Context, in *internalpb.ImportRequestInter
 			resp.Status = merr.Status(merr.WrapErrImportFailed(fmt.Sprintf("no binlog to import, input=%s", in.GetFiles())))
 			return resp, nil
 		}
+		if len(files) > paramtable.Get().DataCoordCfg.MaxFilesPerImportReq.GetAsInt() {
+			resp.Status = merr.Status(merr.WrapErrImportFailed(fmt.Sprintf("The max number of import files should not exceed %d, but got %d",
+				paramtable.Get().DataCoordCfg.MaxFilesPerImportReq.GetAsInt(), len(files))))
+			return resp, nil
+		}
 		log.Info("list binlogs prefixes for import", zap.Any("binlog_prefixes", files))
 	}
 
+	// The import task does not need to be controlled for the time being, and additional development is required later.
+	// Here is a comment, because the current importv2 communicates through messages and needs to ensure idempotence.
+	// Adding this part of the logic will cause importv2 to retry infinitely until the previous import task is completed.
+
 	// Check if the number of jobs exceeds the limit.
-	maxNum := paramtable.Get().DataCoordCfg.MaxImportJobNum.GetAsInt()
-	executingNum := s.importMeta.CountJobBy(ctx, WithoutJobStates(internalpb.ImportJobState_Completed, internalpb.ImportJobState_Failed))
-	if executingNum >= maxNum {
-		resp.Status = merr.Status(merr.WrapErrImportFailed(
-			fmt.Sprintf("The number of jobs has reached the limit, please try again later. " +
-				"If your request is set to only import a single file, " +
-				"please consider importing multiple files in one request for better efficiency.")))
-		return resp, nil
-	}
+	// maxNum := paramtable.Get().DataCoordCfg.MaxImportJobNum.GetAsInt()
+	// executingNum := s.importMeta.CountJobBy(ctx, WithoutJobStates(internalpb.ImportJobState_Completed, internalpb.ImportJobState_Failed))
+	// if executingNum >= maxNum {
+	// 	resp.Status = merr.Status(merr.WrapErrImportFailed(
+	// 		fmt.Sprintf("The number of jobs has reached the limit, please try again later. " +
+	// 			"If your request is set to only import a single file, " +
+	// 			"please consider importing multiple files in one request for better efficiency.")))
+	// 	return resp, nil
+	// }
 
 	// Allocate file ids.
 	idStart, _, err := s.allocator.AllocN(int64(len(files)) + 1)
@@ -1724,15 +1755,28 @@ func (s *Server) ImportV2(ctx context.Context, in *internalpb.ImportRequestInter
 		importFile.Id = idStart + int64(i) + 1
 		return importFile
 	})
+	importCollectionInfo, err := s.handler.GetCollection(ctx, in.GetCollectionID())
+	if err != nil {
+		resp.Status = merr.Status(merr.WrapErrImportFailed(fmt.Sprint("get collection failed, err=%w", err)))
+		return resp, nil
+	}
+	if importCollectionInfo == nil {
+		resp.Status = merr.Status(merr.WrapErrCollectionNotFound(in.GetCollectionID()))
+		return resp, nil
+	}
 
+	jobID := in.GetJobID()
+	if jobID == 0 {
+		jobID = idStart
+	}
 	startTime := time.Now()
 	job := &importJob{
 		ImportJob: &datapb.ImportJob{
-			JobID:          idStart,
+			JobID:          jobID,
 			CollectionID:   in.GetCollectionID(),
 			CollectionName: in.GetCollectionName(),
 			PartitionIDs:   in.GetPartitionIDs(),
-			Vchannels:      in.GetChannelNames(),
+			Vchannels:      importCollectionInfo.VChannelNames,
 			Schema:         in.GetSchema(),
 			TimeoutTs:      timeoutTs,
 			CleanupTs:      math.MaxUint64,
@@ -1740,6 +1784,8 @@ func (s *Server) ImportV2(ctx context.Context, in *internalpb.ImportRequestInter
 			Files:          files,
 			Options:        in.GetOptions(),
 			StartTime:      startTime.Format("2006-01-02T15:04:05Z07:00"),
+			ReadyVchannels: in.GetChannelNames(),
+			DataTs:         in.GetDataTimestamp(),
 		},
 		tr: timerecord.NewTimeRecorder("import job"),
 	}
@@ -1750,7 +1796,11 @@ func (s *Server) ImportV2(ctx context.Context, in *internalpb.ImportRequestInter
 	}
 
 	resp.JobID = fmt.Sprint(job.GetJobID())
-	log.Info("add import job done", zap.Int64("jobID", job.GetJobID()), zap.Any("files", files))
+	log.Info("add import job done",
+		zap.Int64("jobID", job.GetJobID()),
+		zap.Any("files", files),
+		zap.Strings("readyChannels", in.GetChannelNames()),
+	)
 	return resp, nil
 }
 
@@ -1770,6 +1820,7 @@ func (s *Server) GetImportProgress(ctx context.Context, in *internalpb.GetImport
 		resp.Status = merr.Status(merr.WrapErrImportFailed(fmt.Sprint("parse job id failed, err=%w", err)))
 		return resp, nil
 	}
+
 	job := s.importMeta.GetJob(ctx, jobID)
 	if job == nil {
 		resp.Status = merr.Status(merr.WrapErrImportFailed(fmt.Sprintf("import job does not exist, jobID=%d", jobID)))

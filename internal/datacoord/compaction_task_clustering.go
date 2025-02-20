@@ -25,7 +25,6 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
-	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
@@ -52,7 +51,6 @@ type clusteringCompactionTask struct {
 	plan      *datapb.CompactionPlan
 	result    *datapb.CompactionPlanResult
 
-	span             trace.Span
 	allocator        allocator.Allocator
 	meta             CompactionMeta
 	sessions         session.DataNodeManager
@@ -60,7 +58,6 @@ type clusteringCompactionTask struct {
 	analyzeScheduler *taskScheduler
 
 	maxRetryTimes int32
-	slotUsage     int64
 }
 
 func (t *clusteringCompactionTask) GetTaskProto() *datapb.CompactionTask {
@@ -79,7 +76,6 @@ func newClusteringCompactionTask(t *datapb.CompactionTask, allocator allocator.A
 		handler:          handler,
 		analyzeScheduler: analyzeScheduler,
 		maxRetryTimes:    3,
-		slotUsage:        paramtable.Get().DataCoordCfg.ClusteringCompactionSlotUsage.GetAsInt64(),
 	}
 	task.taskProto.Store(t)
 	return task
@@ -112,7 +108,7 @@ func (t *clusteringCompactionTask) Process() bool {
 		lastStateDuration := ts - t.GetTaskProto().GetLastStateStartTime()
 		log.Info("clustering compaction task state changed", zap.String("lastState", lastState), zap.String("currentState", currentState), zap.Int64("elapse seconds", lastStateDuration))
 		metrics.DataCoordCompactionLatency.
-			WithLabelValues(fmt.Sprint(typeutil.IsVectorType(t.GetTaskProto().GetClusteringKeyField().DataType)), fmt.Sprint(t.GetTaskProto().CollectionID), t.GetTaskProto().Channel, datapb.CompactionType_ClusteringCompaction.String(), lastState).
+			WithLabelValues(fmt.Sprint(typeutil.IsVectorType(t.GetTaskProto().GetClusteringKeyField().DataType)), t.GetTaskProto().Channel, datapb.CompactionType_ClusteringCompaction.String(), lastState).
 			Observe(float64(lastStateDuration * 1000))
 		updateOps := []compactionTaskOpt{setRetryTimes(0), setLastStateStartTime(ts)}
 
@@ -121,7 +117,7 @@ func (t *clusteringCompactionTask) Process() bool {
 			elapse := ts - t.GetTaskProto().StartTime
 			log.Info("clustering compaction task total elapse", zap.Duration("costs", time.Duration(elapse)*time.Second))
 			metrics.DataCoordCompactionLatency.
-				WithLabelValues(fmt.Sprint(typeutil.IsVectorType(t.GetTaskProto().GetClusteringKeyField().DataType)), fmt.Sprint(t.GetTaskProto().CollectionID), t.GetTaskProto().Channel, datapb.CompactionType_ClusteringCompaction.String(), "total").
+				WithLabelValues(fmt.Sprint(typeutil.IsVectorType(t.GetTaskProto().GetClusteringKeyField().DataType)), t.GetTaskProto().Channel, datapb.CompactionType_ClusteringCompaction.String(), "total").
 				Observe(float64(elapse * 1000))
 		}
 		err = t.updateAndSaveTaskMeta(updateOps...)
@@ -179,6 +175,14 @@ func (t *clusteringCompactionTask) retryableProcess(ctx context.Context) error {
 func (t *clusteringCompactionTask) Clean() bool {
 	log.Ctx(context.TODO()).Info("clean task", zap.Int64("planID", t.GetTaskProto().GetPlanID()), zap.String("type", t.GetTaskProto().GetType().String()))
 	return t.doClean() == nil
+}
+
+func (t *clusteringCompactionTask) PreparePlan() bool {
+	return true
+}
+
+func (t *clusteringCompactionTask) CheckCompactionContainsSegment(segmentID int64) bool {
+	return false
 }
 
 func (t *clusteringCompactionTask) BuildCompactionRequest() (*datapb.CompactionPlan, error) {
@@ -272,7 +276,6 @@ func (t *clusteringCompactionTask) processExecuting() error {
 	switch result.GetState() {
 	case datapb.CompactionTaskState_completed:
 		t.result = result
-		result := t.result
 		if len(result.GetSegments()) == 0 {
 			log.Warn("illegal compaction results, this should not happen")
 			return merr.WrapErrCompactionResult("compaction result is empty")
@@ -766,22 +769,8 @@ func (t *clusteringCompactionTask) GetResult() *datapb.CompactionPlanResult {
 	return t.result
 }
 
-func (t *clusteringCompactionTask) GetSpan() trace.Span {
-	return t.span
-}
-
-func (t *clusteringCompactionTask) EndSpan() {
-	if t.span != nil {
-		t.span.End()
-	}
-}
-
 func (t *clusteringCompactionTask) SetResult(result *datapb.CompactionPlanResult) {
 	t.result = result
-}
-
-func (t *clusteringCompactionTask) SetSpan(span trace.Span) {
-	t.span = span
 }
 
 func (t *clusteringCompactionTask) SetPlan(plan *datapb.CompactionPlan) {
@@ -805,5 +794,5 @@ func (t *clusteringCompactionTask) NeedReAssignNodeID() bool {
 }
 
 func (t *clusteringCompactionTask) GetSlotUsage() int64 {
-	return t.slotUsage
+	return paramtable.Get().DataCoordCfg.ClusteringCompactionSlotUsage.GetAsInt64()
 }

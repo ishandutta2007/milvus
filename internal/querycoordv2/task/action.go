@@ -24,7 +24,6 @@ import (
 
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/pkg/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
@@ -52,19 +51,26 @@ type Action interface {
 	IsFinished(distMgr *meta.DistributionManager) bool
 	Desc() string
 	String() string
+
+	// return current action's workload effect on target query node
+	// which only works for `Grow` and `Reduce`, cause `Update` won't change query node's workload
+	WorkLoadEffect() int
 }
 
 type BaseAction struct {
 	NodeID typeutil.UniqueID
 	Typ    ActionType
 	Shard  string
+
+	workloadEffect int
 }
 
-func NewBaseAction(nodeID typeutil.UniqueID, typ ActionType, shard string) *BaseAction {
+func NewBaseAction(nodeID typeutil.UniqueID, typ ActionType, shard string, workLoadEffect int) *BaseAction {
 	return &BaseAction{
-		NodeID: nodeID,
-		Typ:    typ,
-		Shard:  shard,
+		NodeID:         nodeID,
+		Typ:            typ,
+		Shard:          shard,
+		workloadEffect: workLoadEffect,
 	}
 }
 
@@ -84,6 +90,10 @@ func (action *BaseAction) String() string {
 	return fmt.Sprintf(`{[type=%v][node=%d][shard=%v]}`, action.Type(), action.Node(), action.Shard)
 }
 
+func (action *BaseAction) WorkLoadEffect() int {
+	return action.workloadEffect
+}
+
 type SegmentAction struct {
 	*BaseAction
 
@@ -93,14 +103,23 @@ type SegmentAction struct {
 	rpcReturned atomic.Bool
 }
 
+// Deprecate, only for existing unit test
 func NewSegmentAction(nodeID typeutil.UniqueID, typ ActionType, shard string, segmentID typeutil.UniqueID) *SegmentAction {
-	return NewSegmentActionWithScope(nodeID, typ, shard, segmentID, querypb.DataScope_All)
+	return NewSegmentActionWithScope(nodeID, typ, shard, segmentID, querypb.DataScope_All, 0)
 }
 
-func NewSegmentActionWithScope(nodeID typeutil.UniqueID, typ ActionType, shard string, segmentID typeutil.UniqueID, scope querypb.DataScope) *SegmentAction {
-	base := NewBaseAction(nodeID, typ, shard)
+func NewSegmentActionWithScope(nodeID typeutil.UniqueID, typ ActionType, shard string, segmentID typeutil.UniqueID, scope querypb.DataScope, rowCount int) *SegmentAction {
+	workloadEffect := 0
+	switch typ {
+	case ActionTypeGrow:
+		workloadEffect = rowCount
+	case ActionTypeReduce:
+		workloadEffect = -rowCount
+	default:
+		workloadEffect = 0
+	}
 	return &SegmentAction{
-		BaseAction:  base,
+		BaseAction:  NewBaseAction(nodeID, typ, shard, workloadEffect),
 		SegmentID:   segmentID,
 		Scope:       scope,
 		rpcReturned: *atomic.NewBool(false),
@@ -116,49 +135,7 @@ func (action *SegmentAction) GetScope() querypb.DataScope {
 }
 
 func (action *SegmentAction) IsFinished(distMgr *meta.DistributionManager) bool {
-	if action.Type() == ActionTypeGrow {
-		// rpc finished
-		if !action.rpcReturned.Load() {
-			return false
-		}
-
-		// segment found in leader view
-		views := distMgr.LeaderViewManager.GetByFilter(
-			meta.WithChannelName2LeaderView(action.Shard),
-			meta.WithSegment2LeaderView(action.SegmentID, false))
-		if len(views) == 0 {
-			return false
-		}
-
-		// segment found in dist
-		segmentInTargetNode := distMgr.SegmentDistManager.GetByFilter(meta.WithNodeID(action.Node()), meta.WithSegmentID(action.SegmentID))
-		return len(segmentInTargetNode) > 0
-	} else if action.Type() == ActionTypeReduce {
-		// FIXME: Now shard leader's segment view is a map of segment ID to node ID,
-		// loading segment replaces the node ID with the new one,
-		// which confuses the condition of finishing,
-		// the leader should return a map of segment ID to list of nodes,
-		// now, we just always commit the release task to executor once.
-		// NOTE: DO NOT create a task containing release action and the action is not the last action
-		sealed := distMgr.SegmentDistManager.GetByFilter(meta.WithNodeID(action.Node()))
-		views := distMgr.LeaderViewManager.GetByFilter(meta.WithNodeID2LeaderView(action.Node()))
-		growing := lo.FlatMap(views, func(view *meta.LeaderView, _ int) []int64 {
-			return lo.Keys(view.GrowingSegments)
-		})
-		segments := make([]int64, 0, len(sealed)+len(growing))
-		for _, segment := range sealed {
-			segments = append(segments, segment.GetID())
-		}
-		segments = append(segments, growing...)
-		if !funcutil.SliceContain(segments, action.GetSegmentID()) {
-			return true
-		}
-		return action.rpcReturned.Load()
-	} else if action.Type() == ActionTypeUpdate {
-		return action.rpcReturned.Load()
-	}
-
-	return true
+	return action.rpcReturned.Load()
 }
 
 func (action *SegmentAction) Desc() string {
@@ -174,8 +151,17 @@ type ChannelAction struct {
 }
 
 func NewChannelAction(nodeID typeutil.UniqueID, typ ActionType, channelName string) *ChannelAction {
+	workloadEffect := 0
+	switch typ {
+	case ActionTypeGrow:
+		workloadEffect = 1
+	case ActionTypeReduce:
+		workloadEffect = -1
+	default:
+		workloadEffect = 0
+	}
 	return &ChannelAction{
-		BaseAction: NewBaseAction(nodeID, typ, channelName),
+		BaseAction: NewBaseAction(nodeID, typ, channelName, workloadEffect),
 	}
 }
 
@@ -210,11 +196,10 @@ type LeaderAction struct {
 
 func NewLeaderAction(leaderID, workerID typeutil.UniqueID, typ ActionType, shard string, segmentID typeutil.UniqueID, version typeutil.UniqueID) *LeaderAction {
 	action := &LeaderAction{
-		BaseAction: NewBaseAction(workerID, typ, shard),
-
-		leaderID:  leaderID,
-		segmentID: segmentID,
-		version:   version,
+		BaseAction: NewBaseAction(workerID, typ, shard, 0),
+		leaderID:   leaderID,
+		segmentID:  segmentID,
+		version:    version,
 	}
 	action.rpcReturned.Store(false)
 	return action
@@ -222,7 +207,7 @@ func NewLeaderAction(leaderID, workerID typeutil.UniqueID, typ ActionType, shard
 
 func NewLeaderUpdatePartStatsAction(leaderID, workerID typeutil.UniqueID, typ ActionType, shard string, partStatsVersions map[int64]int64) *LeaderAction {
 	action := &LeaderAction{
-		BaseAction:        NewBaseAction(workerID, typ, shard),
+		BaseAction:        NewBaseAction(workerID, typ, shard, 0),
 		leaderID:          leaderID,
 		partStatsVersions: partStatsVersions,
 	}

@@ -19,6 +19,7 @@ import (
 	"github.com/milvus-io/milvus/internal/parser/planparserv2"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/exprutil"
+	"github.com/milvus-io/milvus/internal/util/function"
 	"github.com/milvus-io/milvus/internal/util/reduce"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/metrics"
@@ -192,19 +193,9 @@ func (t *searchTask) PreExecute(ctx context.Context) error {
 	}
 	t.SearchRequest.Nq = nq
 
-	var ignoreGrowing bool
-	// parse common search params
-	for i, kv := range t.request.GetSearchParams() {
-		if kv.GetKey() == IgnoreGrowingKey {
-			ignoreGrowing, err = strconv.ParseBool(kv.GetValue())
-			if err != nil {
-				return errors.New("parse search growing failed")
-			}
-			t.request.SearchParams = append(t.request.GetSearchParams()[:i], t.request.GetSearchParams()[i+1:]...)
-			break
-		}
+	if t.SearchRequest.IgnoreGrowing, err = isIgnoreGrowing(t.request.SearchParams); err != nil {
+		return err
 	}
-	t.SearchRequest.IgnoreGrowing = ignoreGrowing
 
 	outputFieldIDs, err := getOutputFieldIDs(t.schema, t.request.GetOutputFields())
 	if err != nil {
@@ -259,6 +250,7 @@ func (t *searchTask) PreExecute(ctx context.Context) error {
 		t.MvccTimestamp = t.request.GetGuaranteeTimestamp()
 		t.GuaranteeTimestamp = t.request.GetGuaranteeTimestamp()
 	}
+	t.SearchRequest.IsIterator = t.isIterator
 
 	if deadline, ok := t.TraceCtx().Deadline(); ok {
 		t.SearchRequest.TimeoutTimestamp = tsoutil.ComposeTSByTime(deadline, 0)
@@ -342,6 +334,8 @@ func setQueryInfoIfMvEnable(queryInfo *planpb.QueryInfo, t *searchTask, plan *pl
 				if err != nil {
 					return err
 				}
+				// force set hints to disable
+				queryInfo.Hints = "disable"
 			}
 			queryInfo.MaterializedViewInvolved = true
 		} else {
@@ -360,10 +354,19 @@ func (t *searchTask) initAdvancedSearchRequest(ctx context.Context) error {
 	// fetch search_growing from search param
 	t.SearchRequest.SubReqs = make([]*internalpb.SubSearchRequest, len(t.request.GetSubReqs()))
 	t.queryInfos = make([]*planpb.QueryInfo, len(t.request.GetSubReqs()))
+	queryFieldIds := []int64{}
 	for index, subReq := range t.request.GetSubReqs() {
 		plan, queryInfo, offset, _, err := t.tryGeneratePlan(subReq.GetSearchParams(), subReq.GetDsl(), subReq.GetExprTemplateValues())
 		if err != nil {
 			return err
+		}
+
+		ignoreGrowing := t.SearchRequest.IgnoreGrowing
+		if !ignoreGrowing {
+			// fetch ignore_growing from sub search param if not set in search request
+			if ignoreGrowing, err = isIgnoreGrowing(subReq.GetSearchParams()); err != nil {
+				return err
+			}
 		}
 
 		internalSubReq := &internalpb.SubSearchRequest{
@@ -378,9 +381,11 @@ func (t *searchTask) initAdvancedSearchRequest(ctx context.Context) error {
 			MetricType:         queryInfo.GetMetricType(),
 			GroupByFieldId:     t.rankParams.GetGroupByFieldId(),
 			GroupSize:          t.rankParams.GetGroupSize(),
+			IgnoreGrowing:      ignoreGrowing,
 		}
 
 		internalSubReq.FieldId = queryInfo.GetQueryFieldId()
+		queryFieldIds = append(queryFieldIds, internalSubReq.FieldId)
 		// set PartitionIDs for sub search
 		if t.partitionKeyMode {
 			// isolation has tighter constraint, check first
@@ -419,6 +424,17 @@ func (t *searchTask) initAdvancedSearchRequest(ctx context.Context) error {
 			zap.Stringer("plan", plan)) // may be very large if large term passed.
 	}
 
+	var err error
+	if function.HasNonBM25Functions(t.schema.CollectionSchema.Functions, queryFieldIds) {
+		exec, err := function.NewFunctionExecutor(t.schema.CollectionSchema)
+		if err != nil {
+			return err
+		}
+		if err := exec.ProcessSearch(t.SearchRequest); err != nil {
+			return err
+		}
+	}
+
 	t.SearchRequest.GroupByFieldId = t.rankParams.GetGroupByFieldId()
 	t.SearchRequest.GroupSize = t.rankParams.GetGroupSize()
 
@@ -426,7 +442,7 @@ func (t *searchTask) initAdvancedSearchRequest(ctx context.Context) error {
 	if t.partitionKeyMode {
 		t.SearchRequest.PartitionIDs = t.partitionIDsSet.Collect()
 	}
-	var err error
+
 	t.reScorers, err = NewReScorers(ctx, len(t.request.GetSubReqs()), t.request.GetSearchParams())
 	if err != nil {
 		log.Info("generate reScorer failed", zap.Any("params", t.request.GetSearchParams()), zap.Error(err))
@@ -497,6 +513,16 @@ func (t *searchTask) initSearchRequest(ctx context.Context) error {
 	t.SearchRequest.DslType = commonpb.DslType_BoolExprV1
 	t.SearchRequest.GroupByFieldId = queryInfo.GroupByFieldId
 	t.SearchRequest.GroupSize = queryInfo.GroupSize
+
+	if function.HasNonBM25Functions(t.schema.CollectionSchema.Functions, []int64{queryInfo.GetQueryFieldId()}) {
+		exec, err := function.NewFunctionExecutor(t.schema.CollectionSchema)
+		if err != nil {
+			return err
+		}
+		if err := exec.ProcessSearch(t.SearchRequest); err != nil {
+			return err
+		}
+	}
 	log.Debug("proxy init search request",
 		zap.Int64s("plan.OutputFieldIds", plan.GetOutputFieldIds()),
 		zap.Stringer("plan", plan)) // may be very large if large term passed.
@@ -521,6 +547,11 @@ func (t *searchTask) tryGeneratePlan(params []*commonpb.KeyValuePair, dsl string
 	if searchInfo.parseError != nil {
 		return nil, nil, 0, false, searchInfo.parseError
 	}
+	if searchInfo.collectionID > 0 && searchInfo.collectionID != t.GetCollectionID() {
+		return nil, nil, 0, false, merr.WrapErrParameterInvalidMsg("collection id:%d in the request is not consistent to that in the search context,"+
+			"alias or database may have been changed: %d", searchInfo.collectionID, t.GetCollectionID())
+	}
+
 	annField := typeutil.GetFieldByName(t.schema.CollectionSchema, annsFieldName)
 	if searchInfo.planInfo.GetGroupByFieldId() != -1 && annField.GetDataType() == schemapb.DataType_BinaryVector {
 		return nil, nil, 0, false, errors.New("not support search_group_by operation based on binary vector column")

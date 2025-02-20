@@ -176,6 +176,9 @@ mq:
     mergeCheckInterval: 1 # the interval time(in seconds) for dispatcher to check whether to merge
     targetBufSize: 16 # the lenth of channel buffer for targe
     maxTolerantLag: 3 # Default value: "3", the timeout(in seconds) that target sends msgPack
+    maxDispatcherNumPerPchannel: 5 # The maximum number of dispatchers per physical channel, primarily to limit the number of consumers and prevent performance issues(e.g., during recovery when a large number of channels are watched).
+    retrySleep: 3 # register retry sleep time in seconds
+    retryTimeout: 60 # register retry timeout in seconds
 
 # Related configuration of pulsar, used to manage Milvus logs of recent mutation operations, output streaming log, and provide log publish-subscribe services.
 pulsar:
@@ -359,6 +362,7 @@ queryCoord:
   checkSegmentInterval: 1000
   checkChannelInterval: 1000
   checkBalanceInterval: 3000
+  autoBalanceInterval: 3000 # the interval for triggerauto balance
   checkIndexInterval: 10000
   channelTaskTimeout: 60000 # 1 minute
   segmentTaskTimeout: 120000 # 2 minute
@@ -479,7 +483,7 @@ queryNode:
   enableSegmentPrune: false # use partition stats to prune data in search/query on shard delegator
   queryStreamBatchSize: 4194304 # return min batch size of stream query
   queryStreamMaxBatchSize: 134217728 # return max batch size of stream query
-  bloomFilterApplyParallelFactor: 4 # parallel factor when to apply pk to bloom filter, default to 4*CPU_CORE_NUM
+  bloomFilterApplyParallelFactor: 2 # parallel factor when to apply pk to bloom filter, default to 2*CPU_CORE_NUM
   workerPooling:
     size: 10 # the size for worker querynode client pool
   ip:  # TCP/IP address of queryNode. If not specified, use the first unicastable address
@@ -520,7 +524,6 @@ dataCoord:
     balanceInterval: 360 # The interval with which the channel manager check dml channel balance status
     checkInterval: 1 # The interval in seconds with which the channel manager advances channel states
     notifyChannelOperationTimeout: 5 # Timeout notifing channel operations (in seconds).
-    maxConcurrentChannelTaskNumPerDN: 32 # The maximum concurrency for each DataNode executing channel tasks (watch, release).
   segment:
     maxSize: 1024 # The maximum size of a segment, unit: MB. datacoord.segment.maxSize and datacoord.segment.sealProportion together determine if a segment can be sealed.
     diskSegmentMaxSize: 2048 # Maximun size of a segment in MB for collection which has Disk index
@@ -570,6 +573,7 @@ dataCoord:
     maxParallelTaskNum: -1 # Deprecated, see datanode.slot.slotCap
     dropTolerance: 86400 # Compaction task will be cleaned after finish longer than this time(in seconds)
     gcInterval: 1800 # The time interval in seconds for compaction gc
+    scheduleInterval: 500 # The time interval in milliseconds for scheduling compaction tasks. If the configuration setting is below 100ms, it will be ajusted upwards to 100ms
     mix:
       triggerInterval: 60 # The time interval in seconds to trigger mix compaction
     levelzero:
@@ -691,7 +695,7 @@ dataNode:
   clusteringCompaction:
     memoryBufferRatio: 0.3 # The ratio of memory buffer of clustering compaction. Data larger than threshold will be flushed to storage.
     workPoolSize: 8 # worker pool size for one clustering compaction job.
-  bloomFilterApplyParallelFactor: 4 # parallel factor when to apply pk to bloom filter, default to 4*CPU_CORE_NUM
+  bloomFilterApplyParallelFactor: 2 # parallel factor when to apply pk to bloom filter, default to 2*CPU_CORE_NUM
   storage:
     deltalog: json # deltalog format, options: [json, parquet]
   ip:  # TCP/IP address of dataNode. If not specified, use the first unicastable address
@@ -770,7 +774,7 @@ log:
 grpc:
   log:
     level: WARNING
-  gracefulStopTimeout: 10 # second, time to wait graceful stop finish
+  gracefulStopTimeout: 3 # second, time to wait graceful stop finish
   client:
     compressionEnabled: false
     dialTimeout: 200
@@ -828,6 +832,8 @@ common:
     # like the old password verification when updating the credential
     superUsers: 
     defaultRootPassword: "Milvus" # default password for root user. The maximum length is 72 characters, and double quotes are required.
+    rootShouldBindRole: false # Whether the root user should bind a role when the authorization is enabled.
+    enablePublicPrivilege: true # Whether to enable public privilege
     rbac:
       overrideBuiltInPrivilegeGroups:
         enabled: false # Whether to override build-in privilege groups
@@ -1101,6 +1107,7 @@ trace:
 gpu:
   initMemSize: 2048 # Gpu Memory Pool init size
   maxMemSize: 4096 # Gpu Memory Pool Max size
+  overloadedMemoryThresholdPercentage: 95
 
 # Any configuration related to the streaming node server.
 streamingNode:
@@ -1126,6 +1133,9 @@ streaming:
     concurrencyRatio: 1 # The concurrency ratio based on number of CPU for wal broadcaster, 1 by default.
   txn:
     defaultKeepaliveTimeout: 10s # The default keepalive timeout for wal txn, 10s by default
+  walWriteAheadBuffer:
+    capacity: 64m # The capacity of write ahead buffer of each wal, 64M by default
+    keepalive: 30s # The keepalive duration for entries in write ahead buffer of each wal, 30s by default
 
 # Any configuration related to the knowhere vector search engine
 knowhere:

@@ -11,6 +11,8 @@ import (
 	"github.com/milvus-io/milvus/internal/streamingnode/client/handler/assignment"
 	"github.com/milvus-io/milvus/internal/streamingnode/client/handler/consumer"
 	"github.com/milvus-io/milvus/internal/streamingnode/client/handler/producer"
+	"github.com/milvus-io/milvus/internal/streamingnode/client/handler/registry"
+	"github.com/milvus-io/milvus/internal/streamingnode/server/wal"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/balancer/picker"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/lazygrpc"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/resolver"
@@ -18,10 +20,15 @@ import (
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/proto/streamingpb"
 	"github.com/milvus-io/milvus/pkg/streaming/util/types"
+	"github.com/milvus-io/milvus/pkg/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/util/typeutil"
 )
 
-var errWaitNextBackoff = errors.New("wait for next backoff")
+var (
+	errWaitNextBackoff                   = errors.New("wait for next backoff")
+	_                  producer.Producer = wal.WAL(nil)
+	_                  consumer.Consumer = wal.Scanner(nil)
+)
 
 type handlerClientImpl struct {
 	lifetime         *typeutil.Lifetime
@@ -33,6 +40,28 @@ type handlerClientImpl struct {
 	newConsumer      func(ctx context.Context, opts *consumer.ConsumerOptions, handlerClient streamingpb.StreamingNodeHandlerServiceClient) (Consumer, error)
 }
 
+// GetLatestMVCCTimestampIfLocal gets the latest mvcc timestamp of the vchannel.
+func (hc *handlerClientImpl) GetLatestMVCCTimestampIfLocal(ctx context.Context, vchannel string) (uint64, error) {
+	if !hc.lifetime.Add(typeutil.LifetimeStateWorking) {
+		return 0, ErrClientClosed
+	}
+	defer hc.lifetime.Done()
+
+	pchannel := funcutil.ToPhysicalChannel(vchannel)
+	// Get current assignment of pchannel.
+	assign := hc.watcher.Get(ctx, pchannel)
+	if assign == nil {
+		return 0, ErrClientAssignmentNotReady
+	}
+
+	// Get the wal at local registry.
+	w, err := registry.GetLocalAvailableWAL(assign.Channel)
+	if err != nil {
+		return 0, err
+	}
+	return w.GetLatestMVCCTimestamp(ctx, vchannel)
+}
+
 // CreateProducer creates a producer.
 func (hc *handlerClientImpl) CreateProducer(ctx context.Context, opts *ProducerOptions) (Producer, error) {
 	if !hc.lifetime.Add(typeutil.LifetimeStateWorking) {
@@ -40,15 +69,27 @@ func (hc *handlerClientImpl) CreateProducer(ctx context.Context, opts *ProducerO
 	}
 	defer hc.lifetime.Done()
 
-	p, err := hc.createHandlerAfterStreamingNodeReady(ctx, opts.PChannel, func(ctx context.Context, assign *types.PChannelInfoAssigned) (any, error) {
+	p, err := hc.createHandlerAfterStreamingNodeReady(ctx, opts.PChannel, func(ctx context.Context, assign *types.PChannelInfoAssigned) (*handlerCreateResult, error) {
+		// Check if the localWAL is assigned at local
+		localWAL, err := registry.GetLocalAvailableWAL(assign.Channel)
+		if err == nil {
+			return localResult(localWAL), nil
+		}
+		if !shouldUseRemoteWAL(err) {
+			return nil, err
+		}
 		// Wait for handler service is ready.
 		handlerService, err := hc.service.GetService(ctx)
 		if err != nil {
 			return nil, err
 		}
-		return hc.newProducer(ctx, &producer.ProducerOptions{
+		remoteWAL, err := hc.newProducer(ctx, &producer.ProducerOptions{
 			Assignment: assign,
 		}, handlerService)
+		if err != nil {
+			return nil, err
+		}
+		return remoteResult(remoteWAL), nil
 	})
 	if err != nil {
 		return nil, err
@@ -63,19 +104,41 @@ func (hc *handlerClientImpl) CreateConsumer(ctx context.Context, opts *ConsumerO
 	}
 	defer hc.lifetime.Done()
 
-	c, err := hc.createHandlerAfterStreamingNodeReady(ctx, opts.PChannel, func(ctx context.Context, assign *types.PChannelInfoAssigned) (any, error) {
+	c, err := hc.createHandlerAfterStreamingNodeReady(ctx, opts.PChannel, func(ctx context.Context, assign *types.PChannelInfoAssigned) (*handlerCreateResult, error) {
+		// Check if the localWAL is assigned at local
+		localWAL, err := registry.GetLocalAvailableWAL(assign.Channel)
+		if err == nil {
+			localScanner, err := localWAL.Read(ctx, wal.ReadOption{
+				VChannel:       opts.VChannel,
+				DeliverPolicy:  opts.DeliverPolicy,
+				MessageFilter:  opts.DeliverFilters,
+				MesasgeHandler: opts.MessageHandler,
+			})
+			if err != nil {
+				return nil, err
+			}
+			return localResult(localScanner), nil
+		}
+		if !shouldUseRemoteWAL(err) {
+			return nil, err
+		}
+
 		// Wait for handler service is ready.
 		handlerService, err := hc.service.GetService(ctx)
 		if err != nil {
 			return nil, err
 		}
-		return hc.newConsumer(ctx, &consumer.ConsumerOptions{
+		remoteScanner, err := hc.newConsumer(ctx, &consumer.ConsumerOptions{
 			Assignment:     assign,
 			VChannel:       opts.VChannel,
 			DeliverPolicy:  opts.DeliverPolicy,
 			DeliverFilters: opts.DeliverFilters,
 			MessageHandler: opts.MessageHandler,
 		}, handlerService)
+		if err != nil {
+			return nil, err
+		}
+		return remoteResult(remoteScanner), nil
 	})
 	if err != nil {
 		return nil, err
@@ -83,9 +146,24 @@ func (hc *handlerClientImpl) CreateConsumer(ctx context.Context, opts *ConsumerO
 	return c.(Consumer), nil
 }
 
+func localResult(result any) *handlerCreateResult {
+	return &handlerCreateResult{result: result, isLocal: true}
+}
+
+func remoteResult(result any) *handlerCreateResult {
+	return &handlerCreateResult{result: result, isLocal: false}
+}
+
+type handlerCreateResult struct {
+	result  any
+	isLocal bool
+}
+
+type handlerCreateFunc func(ctx context.Context, assign *types.PChannelInfoAssigned) (*handlerCreateResult, error)
+
 // createHandlerAfterStreamingNodeReady creates a handler until streaming node ready.
 // If streaming node is not ready, it will block until new assignment term is coming or context timeout.
-func (hc *handlerClientImpl) createHandlerAfterStreamingNodeReady(ctx context.Context, pchannel string, create func(ctx context.Context, assign *types.PChannelInfoAssigned) (any, error)) (any, error) {
+func (hc *handlerClientImpl) createHandlerAfterStreamingNodeReady(ctx context.Context, pchannel string, create handlerCreateFunc) (any, error) {
 	logger := log.With(zap.String("pchannel", pchannel))
 	// TODO: backoff should be configurable.
 	backoff := backoff.NewExponentialBackOff()
@@ -93,9 +171,10 @@ func (hc *handlerClientImpl) createHandlerAfterStreamingNodeReady(ctx context.Co
 		assign := hc.watcher.Get(ctx, pchannel)
 		if assign != nil {
 			// Find assignment, try to create producer on this assignment.
-			c, err := create(ctx, assign)
+			createResult, err := create(ctx, assign)
 			if err == nil {
-				return c, nil
+				logger.Info("create handler success", zap.Any("assignment", assign), zap.Bool("isLocal", createResult.isLocal))
+				return createResult.result, nil
 			}
 			logger.Warn("create handler failed", zap.Any("assignment", assign), zap.Error(err))
 
@@ -155,6 +234,21 @@ func isPermanentFailureUntilNewAssignment(err error) bool {
 		return true
 	}
 	// The error is reported by remote server that the wal is not exist at remote server.
+	streamingServiceErr := status.AsStreamingError(err)
+	return streamingServiceErr.IsWrongStreamingNode()
+}
+
+// shouldUseRemoteWAL checks if use remote wal when given error happens.
+func shouldUseRemoteWAL(err error) bool {
+	if err == nil {
+		panic("the incoming error should never be nil")
+	}
+	// When following error happens, we should try to make a remote wal fetch.
+	// 1. If current node didn't deploy any streaming node.
+	if errors.Is(err, registry.ErrNoStreamingNodeDeployed) {
+		return true
+	}
+	// 2. If the wal is not exist at current streaming node.
 	streamingServiceErr := status.AsStreamingError(err)
 	return streamingServiceErr.IsWrongStreamingNode()
 }

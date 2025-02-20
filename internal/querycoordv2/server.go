@@ -671,6 +671,7 @@ func (s *Server) Stop() error {
 // UpdateStateCode updates the status of the coord, including healthy, unhealthy
 func (s *Server) UpdateStateCode(code commonpb.StateCode) {
 	s.status.Store(int32(code))
+	log.Ctx(s.ctx).Info("update querycoord state", zap.String("state", code.String()))
 }
 
 func (s *Server) State() commonpb.StateCode {
@@ -858,8 +859,16 @@ func (s *Server) tryHandleNodeUp() {
 }
 
 func (s *Server) handleNodeUp(node int64) {
+	nodeInfo := s.nodeMgr.Get(node)
+	if nodeInfo == nil {
+		return
+	}
 	s.taskScheduler.AddExecutor(node)
 	s.distController.StartDistInstance(s.ctx, node)
+	if nodeInfo.IsEmbeddedQueryNodeInStreamingNode() {
+		// The querynode embedded in the streaming node can not work with streaming node.
+		return
+	}
 	// need assign to new rg and replica
 	s.meta.ResourceManager.HandleNodeUp(s.ctx, node)
 }

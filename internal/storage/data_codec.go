@@ -146,9 +146,10 @@ func (insertCodec *InsertCodec) SerializePkStats(stats *PrimaryKeyStats, rowNum 
 
 	buffer := statsWriter.GetBuffer()
 	return &Blob{
-		Key:    blobKey,
-		Value:  buffer,
-		RowNum: rowNum,
+		Key:        blobKey,
+		Value:      buffer,
+		RowNum:     rowNum,
+		MemorySize: int64(len(buffer)),
 	}, nil
 }
 
@@ -337,7 +338,7 @@ func AddFieldDataToPayload(eventWriter *insertEventWriter, dataType schemapb.Dat
 		if err = eventWriter.AddDoubleToPayload(singleData.(*DoubleFieldData).Data, singleData.(*DoubleFieldData).ValidData); err != nil {
 			return err
 		}
-	case schemapb.DataType_String, schemapb.DataType_VarChar:
+	case schemapb.DataType_String, schemapb.DataType_VarChar, schemapb.DataType_Text:
 		for i, singleString := range singleData.(*StringFieldData).Data {
 			isValid := true
 			if len(singleData.(*StringFieldData).ValidData) != 0 {
@@ -568,7 +569,7 @@ func AddInsertData(dataType schemapb.DataType, data interface{}, insertData *Ins
 		insertData.Data[fieldID] = doubleFieldData
 		return len(singleData), nil
 
-	case schemapb.DataType_String, schemapb.DataType_VarChar:
+	case schemapb.DataType_String, schemapb.DataType_VarChar, schemapb.DataType_Text:
 		singleData := data.([]string)
 		if fieldData == nil {
 			fieldData = &StringFieldData{Data: make([]string, 0, rowNum)}

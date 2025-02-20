@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/errors"
+	"github.com/magiconair/properties/assert"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
@@ -60,7 +61,7 @@ func (s *CompactionPlanHandlerSuite) SetupTest() {
 	s.mockCm = NewMockChannelManager(s.T())
 	s.mockSessMgr = session.NewMockDataNodeManager(s.T())
 	s.cluster = NewMockCluster(s.T())
-	s.handler = newCompactionPlanHandler(s.cluster, s.mockSessMgr, s.mockMeta, s.mockAlloc, nil, nil)
+	s.handler = newCompactionPlanHandler(s.cluster, s.mockSessMgr, s.mockMeta, s.mockAlloc, nil)
 	s.mockHandler = NewNMockHandler(s.T())
 	s.mockHandler.EXPECT().GetCollection(mock.Anything, mock.Anything).Return(&collectionInfo{}, nil).Maybe()
 }
@@ -75,7 +76,6 @@ func (s *CompactionPlanHandlerSuite) TestScheduleEmpty() {
 
 func (s *CompactionPlanHandlerSuite) generateInitTasksForSchedule() {
 	task1 := &mixCompactionTask{
-		plan:     &datapb.CompactionPlan{PlanID: 1, Channel: "ch-1", Type: datapb.CompactionType_MixCompaction},
 		sessions: s.mockSessMgr,
 		meta:     s.mockMeta,
 	}
@@ -88,7 +88,6 @@ func (s *CompactionPlanHandlerSuite) generateInitTasksForSchedule() {
 	})
 
 	task2 := &mixCompactionTask{
-		plan:     &datapb.CompactionPlan{PlanID: 2, Channel: "ch-1", Type: datapb.CompactionType_MixCompaction},
 		sessions: s.mockSessMgr,
 		meta:     s.mockMeta,
 	}
@@ -101,7 +100,6 @@ func (s *CompactionPlanHandlerSuite) generateInitTasksForSchedule() {
 	})
 
 	task3 := &mixCompactionTask{
-		plan:     &datapb.CompactionPlan{PlanID: 3, Channel: "ch-2", Type: datapb.CompactionType_MixCompaction},
 		sessions: s.mockSessMgr,
 		meta:     s.mockMeta,
 	}
@@ -114,7 +112,6 @@ func (s *CompactionPlanHandlerSuite) generateInitTasksForSchedule() {
 	})
 
 	task4 := &mixCompactionTask{
-		plan:     &datapb.CompactionPlan{PlanID: 4, Channel: "ch-3", Type: datapb.CompactionType_Level0DeleteCompaction},
 		sessions: s.mockSessMgr,
 		meta:     s.mockMeta,
 	}
@@ -134,6 +131,22 @@ func (s *CompactionPlanHandlerSuite) generateInitTasksForSchedule() {
 
 func (s *CompactionPlanHandlerSuite) TestScheduleNodeWith1ParallelTask() {
 	// dataNode 101's paralleTasks has 1 task running, not L0 task
+	s.mockMeta.EXPECT().SelectSegments(mock.Anything, mock.Anything, mock.Anything).Return([]*SegmentInfo{
+		{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:           1,
+				CollectionID: 2,
+				PartitionID:  3,
+			},
+			currRows:        0,
+			allocations:     nil,
+			lastFlushTime:   time.Time{},
+			isCompacting:    false,
+			lastWrittenTime: time.Time{},
+			isStating:       false,
+		},
+	})
+	s.mockMeta.EXPECT().CheckSegmentsStating(mock.Anything, mock.Anything).Return(true, false)
 	tests := []struct {
 		description string
 		tasks       []CompactionTask
@@ -225,8 +238,8 @@ func (s *CompactionPlanHandlerSuite) TestScheduleNodeWith1ParallelTask() {
 			s.SetupTest()
 			s.generateInitTasksForSchedule()
 			// submit the testing tasks
-			for i, t := range test.tasks {
-				t.SetPlan(test.plans[i])
+			for _, t := range test.tasks {
+				// t.SetPlan(test.plans[i])
 				s.handler.submitTask(t)
 			}
 
@@ -240,6 +253,22 @@ func (s *CompactionPlanHandlerSuite) TestScheduleNodeWith1ParallelTask() {
 }
 
 func (s *CompactionPlanHandlerSuite) TestScheduleWithSlotLimit() {
+	s.mockMeta.EXPECT().SelectSegments(mock.Anything, mock.Anything, mock.Anything).Return([]*SegmentInfo{
+		{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:           1,
+				CollectionID: 2,
+				PartitionID:  3,
+			},
+			currRows:        0,
+			allocations:     nil,
+			lastFlushTime:   time.Time{},
+			isCompacting:    false,
+			lastWrittenTime: time.Time{},
+			isStating:       false,
+		},
+	})
+	s.mockMeta.EXPECT().CheckSegmentsStating(mock.Anything, mock.Anything).Return(true, false)
 	tests := []struct {
 		description string
 		tasks       []CompactionTask
@@ -300,8 +329,8 @@ func (s *CompactionPlanHandlerSuite) TestScheduleWithSlotLimit() {
 			}).Maybe()
 			s.generateInitTasksForSchedule()
 			// submit the testing tasks
-			for i, t := range test.tasks {
-				t.SetPlan(test.plans[i])
+			for _, t := range test.tasks {
+				// t.SetPlan(test.plans[i])
 				s.handler.submitTask(t)
 			}
 			assigner := newSlotBasedNodeAssigner(s.cluster)
@@ -316,6 +345,23 @@ func (s *CompactionPlanHandlerSuite) TestScheduleWithSlotLimit() {
 func (s *CompactionPlanHandlerSuite) TestScheduleNodeWithL0Executing() {
 	// dataNode 102's paralleTasks has running L0 tasks
 	// nothing of the same channel will be able to schedule
+
+	s.mockMeta.EXPECT().SelectSegments(mock.Anything, mock.Anything, mock.Anything).Return([]*SegmentInfo{
+		{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:           1,
+				CollectionID: 2,
+				PartitionID:  3,
+			},
+			currRows:        0,
+			allocations:     nil,
+			lastFlushTime:   time.Time{},
+			isCompacting:    false,
+			lastWrittenTime: time.Time{},
+			isStating:       false,
+		},
+	})
+	s.mockMeta.EXPECT().CheckSegmentsStating(mock.Anything, mock.Anything).Return(true, false)
 	tests := []struct {
 		description string
 		tasks       []CompactionTask
@@ -454,14 +500,13 @@ func (s *CompactionPlanHandlerSuite) TestPickAnyNode() {
 
 	assigner := newSlotBasedNodeAssigner(s.cluster)
 	assigner.slots = map[int64]int64{
-		100: 16,
-		101: 23,
+		100: 9,
+		101: 16,
 	}
 
 	task1 := newMixCompactionTask(&datapb.CompactionTask{
 		Type: datapb.CompactionType_MixCompaction,
 	}, nil, s.mockMeta, nil)
-	task1.slotUsage = paramtable.Get().DataCoordCfg.MixCompactionSlotUsage.GetAsInt64()
 	ok := assigner.assign(task1)
 	s.Equal(true, ok)
 	s.Equal(int64(101), task1.GetTaskProto().GetNodeID())
@@ -469,7 +514,6 @@ func (s *CompactionPlanHandlerSuite) TestPickAnyNode() {
 	task2 := newMixCompactionTask(&datapb.CompactionTask{
 		Type: datapb.CompactionType_MixCompaction,
 	}, nil, s.mockMeta, nil)
-	task2.slotUsage = paramtable.Get().DataCoordCfg.MixCompactionSlotUsage.GetAsInt64()
 	ok = assigner.assign(task2)
 	s.Equal(true, ok)
 	s.Equal(int64(100), task2.GetTaskProto().GetNodeID())
@@ -477,29 +521,12 @@ func (s *CompactionPlanHandlerSuite) TestPickAnyNode() {
 	task3 := newMixCompactionTask(&datapb.CompactionTask{
 		Type: datapb.CompactionType_MixCompaction,
 	}, nil, s.mockMeta, nil)
-	task3.slotUsage = paramtable.Get().DataCoordCfg.MixCompactionSlotUsage.GetAsInt64()
 
 	ok = assigner.assign(task3)
 	s.Equal(true, ok)
 	s.Equal(int64(101), task3.GetTaskProto().GetNodeID())
 
 	ok = assigner.assign(&mixCompactionTask{})
-	s.Equal(false, ok)
-}
-
-func (s *CompactionPlanHandlerSuite) TestPickAnyNodeSlotUsageShouldNotBeZero() {
-	s.SetupTest()
-	nodeSlots := map[int64]int64{
-		100: 16,
-		101: 23,
-	}
-	task1 := newMixCompactionTask(&datapb.CompactionTask{
-		Type: datapb.CompactionType_MixCompaction,
-	}, nil, s.mockMeta, nil)
-	task1.slotUsage = 0
-	assigner := newSlotBasedNodeAssigner(s.cluster)
-	assigner.slots = nodeSlots
-	ok := assigner.assign(task1)
 	s.Equal(false, ok)
 }
 
@@ -515,12 +542,10 @@ func (s *CompactionPlanHandlerSuite) TestPickAnyNodeForClusteringTask() {
 	task1 := newClusteringCompactionTask(&datapb.CompactionTask{
 		Type: datapb.CompactionType_ClusteringCompaction,
 	}, nil, s.mockMeta, nil, nil, nil)
-	task1.slotUsage = paramtable.Get().DataCoordCfg.ClusteringCompactionSlotUsage.GetAsInt64()
 
 	task2 := newClusteringCompactionTask(&datapb.CompactionTask{
 		Type: datapb.CompactionType_ClusteringCompaction,
 	}, nil, s.mockMeta, nil, nil, nil)
-	task2.slotUsage = paramtable.Get().DataCoordCfg.ClusteringCompactionSlotUsage.GetAsInt64()
 
 	executingTasks[1] = task1
 	executingTasks[2] = task2
@@ -546,11 +571,6 @@ func (s *CompactionPlanHandlerSuite) TestRemoveTasksByChannel() {
 		Channel: ch,
 		NodeID:  1,
 	}, nil, s.mockMeta, s.mockSessMgr)
-	t1.plan = &datapb.CompactionPlan{
-		PlanID:  19530,
-		Channel: ch,
-		Type:    datapb.CompactionType_MixCompaction,
-	}
 
 	t2 := newMixCompactionTask(&datapb.CompactionTask{
 		PlanID:  19531,
@@ -558,11 +578,6 @@ func (s *CompactionPlanHandlerSuite) TestRemoveTasksByChannel() {
 		Channel: ch,
 		NodeID:  1,
 	}, nil, s.mockMeta, s.mockSessMgr)
-	t2.plan = &datapb.CompactionPlan{
-		PlanID:  19531,
-		Channel: ch,
-		Type:    datapb.CompactionType_MixCompaction,
-	}
 
 	s.handler.submitTask(t1)
 	s.handler.restoreTask(t2)
@@ -579,11 +594,6 @@ func (s *CompactionPlanHandlerSuite) TestGetCompactionTask() {
 		Channel:   "ch-01",
 		State:     datapb.CompactionTaskState_executing,
 	}, nil, s.mockMeta, s.mockSessMgr)
-	t1.plan = &datapb.CompactionPlan{
-		PlanID:  1,
-		Type:    datapb.CompactionType_MixCompaction,
-		Channel: "ch-01",
-	}
 
 	t2 := newMixCompactionTask(&datapb.CompactionTask{
 		TriggerID: 1,
@@ -592,11 +602,6 @@ func (s *CompactionPlanHandlerSuite) TestGetCompactionTask() {
 		Channel:   "ch-01",
 		State:     datapb.CompactionTaskState_completed,
 	}, nil, s.mockMeta, s.mockSessMgr)
-	t2.plan = &datapb.CompactionPlan{
-		PlanID:  2,
-		Type:    datapb.CompactionType_MixCompaction,
-		Channel: "ch-01",
-	}
 
 	t3 := newL0CompactionTask(&datapb.CompactionTask{
 		TriggerID: 1,
@@ -605,11 +610,6 @@ func (s *CompactionPlanHandlerSuite) TestGetCompactionTask() {
 		Channel:   "ch-02",
 		State:     datapb.CompactionTaskState_failed,
 	}, nil, s.mockMeta, s.mockSessMgr)
-	t3.plan = &datapb.CompactionPlan{
-		PlanID:  3,
-		Type:    datapb.CompactionType_Level0DeleteCompaction,
-		Channel: "ch-02",
-	}
 
 	inTasks := map[int64]CompactionTask{
 		1: t1,
@@ -626,6 +626,22 @@ func (s *CompactionPlanHandlerSuite) TestGetCompactionTask() {
 		}
 		return ret
 	})
+	s.mockMeta.EXPECT().SelectSegments(mock.Anything, mock.Anything, mock.Anything).Return([]*SegmentInfo{
+		{
+			SegmentInfo: &datapb.SegmentInfo{
+				ID:           1,
+				CollectionID: 2,
+				PartitionID:  3,
+			},
+			currRows:        0,
+			allocations:     nil,
+			lastFlushTime:   time.Time{},
+			isCompacting:    false,
+			lastWrittenTime: time.Time{},
+			isStating:       false,
+		},
+	})
+	s.mockMeta.EXPECT().CheckSegmentsStating(mock.Anything, mock.Anything).Return(true, false)
 
 	for _, t := range inTasks {
 		s.handler.submitTask(t)
@@ -645,7 +661,7 @@ func (s *CompactionPlanHandlerSuite) TestCompactionQueueFull() {
 	paramtable.Get().Save("dataCoord.compaction.taskQueueCapacity", "1")
 	defer paramtable.Get().Reset("dataCoord.compaction.taskQueueCapacity")
 
-	s.handler = newCompactionPlanHandler(s.cluster, s.mockSessMgr, s.mockMeta, s.mockAlloc, nil, nil)
+	s.handler = newCompactionPlanHandler(s.cluster, s.mockSessMgr, s.mockMeta, s.mockAlloc, nil)
 
 	t1 := newMixCompactionTask(&datapb.CompactionTask{
 		TriggerID: 1,
@@ -654,11 +670,6 @@ func (s *CompactionPlanHandlerSuite) TestCompactionQueueFull() {
 		Channel:   "ch-01",
 		State:     datapb.CompactionTaskState_executing,
 	}, nil, s.mockMeta, s.mockSessMgr)
-	t1.plan = &datapb.CompactionPlan{
-		PlanID:  1,
-		Type:    datapb.CompactionType_MixCompaction,
-		Channel: "ch-01",
-	}
 
 	s.NoError(s.handler.submitTask(t1))
 
@@ -669,11 +680,6 @@ func (s *CompactionPlanHandlerSuite) TestCompactionQueueFull() {
 		Channel:   "ch-01",
 		State:     datapb.CompactionTaskState_completed,
 	}, nil, s.mockMeta, s.mockSessMgr)
-	t2.plan = &datapb.CompactionPlan{
-		PlanID:  2,
-		Type:    datapb.CompactionType_MixCompaction,
-		Channel: "ch-01",
-	}
 
 	s.Error(s.handler.submitTask(t2))
 }
@@ -681,7 +687,7 @@ func (s *CompactionPlanHandlerSuite) TestCompactionQueueFull() {
 func (s *CompactionPlanHandlerSuite) TestExecCompactionPlan() {
 	s.SetupTest()
 	s.mockMeta.EXPECT().CheckAndSetSegmentsCompacting(mock.Anything, mock.Anything).Return(true, true).Maybe()
-	handler := newCompactionPlanHandler(nil, s.mockSessMgr, s.mockMeta, s.mockAlloc, nil, nil)
+	handler := newCompactionPlanHandler(nil, s.mockSessMgr, s.mockMeta, s.mockAlloc, nil)
 
 	task := &datapb.CompactionTask{
 		TriggerID: 1,
@@ -730,11 +736,6 @@ func (s *CompactionPlanHandlerSuite) TestCheckCompaction() {
 		State:            datapb.CompactionTaskState_executing,
 		NodeID:           111,
 	}, nil, s.mockMeta, s.mockSessMgr)
-	t1.plan = &datapb.CompactionPlan{
-		PlanID: 1, Channel: "ch-1",
-		TimeoutInSeconds: 1,
-		Type:             datapb.CompactionType_MixCompaction,
-	}
 
 	t2 := newMixCompactionTask(&datapb.CompactionTask{
 		PlanID:  2,
@@ -743,11 +744,6 @@ func (s *CompactionPlanHandlerSuite) TestCheckCompaction() {
 		State:   datapb.CompactionTaskState_executing,
 		NodeID:  111,
 	}, nil, s.mockMeta, s.mockSessMgr)
-	t2.plan = &datapb.CompactionPlan{
-		PlanID:  2,
-		Channel: "ch-1",
-		Type:    datapb.CompactionType_MixCompaction,
-	}
 
 	t3 := newMixCompactionTask(&datapb.CompactionTask{
 		PlanID:  3,
@@ -756,11 +752,6 @@ func (s *CompactionPlanHandlerSuite) TestCheckCompaction() {
 		State:   datapb.CompactionTaskState_timeout,
 		NodeID:  111,
 	}, nil, s.mockMeta, s.mockSessMgr)
-	t3.plan = &datapb.CompactionPlan{
-		PlanID:  3,
-		Channel: "ch-1",
-		Type:    datapb.CompactionType_MixCompaction,
-	}
 
 	t4 := newMixCompactionTask(&datapb.CompactionTask{
 		PlanID:  4,
@@ -769,11 +760,6 @@ func (s *CompactionPlanHandlerSuite) TestCheckCompaction() {
 		State:   datapb.CompactionTaskState_timeout,
 		NodeID:  111,
 	}, nil, s.mockMeta, s.mockSessMgr)
-	t4.plan = &datapb.CompactionPlan{
-		PlanID:  4,
-		Channel: "ch-1",
-		Type:    datapb.CompactionType_MixCompaction,
-	}
 
 	t6 := newMixCompactionTask(&datapb.CompactionTask{
 		PlanID:  6,
@@ -782,11 +768,6 @@ func (s *CompactionPlanHandlerSuite) TestCheckCompaction() {
 		State:   datapb.CompactionTaskState_executing,
 		NodeID:  111,
 	}, nil, s.mockMeta, s.mockSessMgr)
-	t6.plan = &datapb.CompactionPlan{
-		PlanID:  6,
-		Channel: "ch-2",
-		Type:    datapb.CompactionType_MixCompaction,
-	}
 
 	inTasks := map[int64]CompactionTask{
 		1: t1,
@@ -1206,4 +1187,61 @@ func TestCheckDelay(t *testing.T) {
 		StartTime: time.Now().Add(-100 * time.Minute).Unix(),
 	}, nil, nil, nil, nil, nil)
 	handler.checkDelay(t3)
+}
+
+func TestGetCompactionTasksNum(t *testing.T) {
+	queueTasks := NewCompactionQueue(10, DefaultPrioritizer)
+	queueTasks.Enqueue(
+		newMixCompactionTask(&datapb.CompactionTask{
+			StartTime:    time.Now().Add(-100 * time.Minute).Unix(),
+			CollectionID: 1,
+			Type:         datapb.CompactionType_MixCompaction,
+		}, nil, nil, nil),
+	)
+	queueTasks.Enqueue(
+		newL0CompactionTask(&datapb.CompactionTask{
+			StartTime:    time.Now().Add(-100 * time.Minute).Unix(),
+			CollectionID: 1,
+			Type:         datapb.CompactionType_Level0DeleteCompaction,
+		}, nil, nil, nil),
+	)
+	queueTasks.Enqueue(
+		newClusteringCompactionTask(&datapb.CompactionTask{
+			StartTime:    time.Now().Add(-100 * time.Minute).Unix(),
+			CollectionID: 10,
+			Type:         datapb.CompactionType_ClusteringCompaction,
+		}, nil, nil, nil, nil, nil),
+	)
+	executingTasks := make(map[int64]CompactionTask, 0)
+	executingTasks[1] = newMixCompactionTask(&datapb.CompactionTask{
+		StartTime:    time.Now().Add(-100 * time.Minute).Unix(),
+		CollectionID: 1,
+		Type:         datapb.CompactionType_MixCompaction,
+	}, nil, nil, nil)
+	executingTasks[2] = newL0CompactionTask(&datapb.CompactionTask{
+		StartTime:    time.Now().Add(-100 * time.Minute).Unix(),
+		CollectionID: 10,
+		Type:         datapb.CompactionType_Level0DeleteCompaction,
+	}, nil, nil, nil)
+
+	handler := &compactionPlanHandler{
+		queueTasks:     queueTasks,
+		executingTasks: executingTasks,
+	}
+	t.Run("no filter", func(t *testing.T) {
+		i := handler.getCompactionTasksNum()
+		assert.Equal(t, 5, i)
+	})
+	t.Run("collection id filter", func(t *testing.T) {
+		i := handler.getCompactionTasksNum(CollectionIDCompactionTaskFilter(1))
+		assert.Equal(t, 3, i)
+	})
+	t.Run("l0 compaction filter", func(t *testing.T) {
+		i := handler.getCompactionTasksNum(L0CompactionCompactionTaskFilter())
+		assert.Equal(t, 2, i)
+	})
+	t.Run("collection id and l0 compaction filter", func(t *testing.T) {
+		i := handler.getCompactionTasksNum(CollectionIDCompactionTaskFilter(1), L0CompactionCompactionTaskFilter())
+		assert.Equal(t, 1, i)
+	})
 }

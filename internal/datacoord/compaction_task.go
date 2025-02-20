@@ -17,8 +17,6 @@
 package datacoord
 
 import (
-	"go.opentelemetry.io/otel/trace"
-
 	"github.com/milvus-io/milvus/pkg/proto/datapb"
 )
 
@@ -40,14 +38,14 @@ type CompactionTask interface {
 
 	SetTask(*datapb.CompactionTask)
 	GetTaskProto() *datapb.CompactionTask
-	SetPlan(plan *datapb.CompactionPlan)
 	ShadowClone(opts ...compactionTaskOpt) *datapb.CompactionTask
 
 	SetNodeID(UniqueID) error
 	NeedReAssignNodeID() bool
-	GetSpan() trace.Span
-	SetSpan(trace.Span)
 	SaveTaskMeta() error
+
+	PreparePlan() bool
+	CheckCompactionContainsSegment(segmentID int64) bool
 }
 
 type compactionTaskOpt func(task *datapb.CompactionTask)

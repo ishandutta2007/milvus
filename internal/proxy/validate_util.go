@@ -96,6 +96,10 @@ func (v *validateUtil) Validate(data []*schemapb.FieldData, helper *typeutil.Sch
 			if err := v.checkVarCharFieldData(field, fieldSchema); err != nil {
 				return err
 			}
+		case schemapb.DataType_Text:
+			if err := v.checkTextFieldData(field, fieldSchema); err != nil {
+				return err
+			}
 		case schemapb.DataType_JSON:
 			if err := v.checkJSONFieldData(field, fieldSchema); err != nil {
 				return err
@@ -672,6 +676,29 @@ func (v *validateUtil) checkVarCharFieldData(field *schemapb.FieldData, fieldSch
 	return nil
 }
 
+func (v *validateUtil) checkTextFieldData(field *schemapb.FieldData, fieldSchema *schemapb.FieldSchema) error {
+	strArr := field.GetScalars().GetStringData().GetData()
+	if strArr == nil && fieldSchema.GetDefaultValue() == nil && !fieldSchema.GetNullable() {
+		msg := fmt.Sprintf("text field '%v' is illegal", field.GetFieldName())
+		return merr.WrapErrParameterInvalid("need text array", msg)
+	}
+
+	if v.checkMaxLen {
+		maxLength, err := parameterutil.GetMaxLength(fieldSchema)
+		if err != nil {
+			return err
+		}
+
+		if i, ok := verifyLengthPerRow(strArr, maxLength); !ok {
+			return merr.WrapErrParameterInvalidMsg("length of text field %s exceeds max length, row number: %d, length: %d, max length: %d",
+				fieldSchema.GetName(), i, len(strArr[i]), maxLength)
+		}
+		return nil
+	}
+
+	return nil
+}
+
 func (v *validateUtil) checkJSONFieldData(field *schemapb.FieldData, fieldSchema *schemapb.FieldSchema) error {
 	jsonArray := field.GetScalars().GetJsonData().GetData()
 	if jsonArray == nil && fieldSchema.GetDefaultValue() == nil && !fieldSchema.GetNullable() {
@@ -932,13 +959,5 @@ func newValidateUtil(opts ...validateOption) *validateUtil {
 }
 
 func ValidateAutoIndexMmapConfig(isVectorField bool, indexParams map[string]string) error {
-	if !Params.AutoIndexConfig.Enable.GetAsBool() {
-		return nil
-	}
-
-	_, ok := indexParams[common.MmapEnabledKey]
-	if ok && isVectorField {
-		return fmt.Errorf("mmap index is not supported to config for the collection in auto index mode")
-	}
-	return nil
+	return common.ValidateAutoIndexMmapConfig(Params.AutoIndexConfig.Enable.GetAsBool(), isVectorField, indexParams)
 }

@@ -48,8 +48,9 @@ const (
 	// DefaultServiceRoot default root path used in kv by Session
 	DefaultServiceRoot = "session/"
 	// DefaultIDKey default id key for Session
-	DefaultIDKey         = "id"
-	SupportedLabelPrefix = "MILVUS_SERVER_LABEL_"
+	DefaultIDKey                        = "id"
+	SupportedLabelPrefix                = "MILVUS_SERVER_LABEL_"
+	LabelStreamingNodeEmbeddedQueryNode = "QUERYNODE_STREAMING-EMBEDDED"
 )
 
 // SessionEventType session event type
@@ -91,15 +92,16 @@ type IndexEngineVersion struct {
 
 // SessionRaw the persistent part of Session.
 type SessionRaw struct {
-	ServerID           int64  `json:"ServerID,omitempty"`
-	ServerName         string `json:"ServerName,omitempty"`
-	Address            string `json:"Address,omitempty"`
-	Exclusive          bool   `json:"Exclusive,omitempty"`
-	Stopping           bool   `json:"Stopping,omitempty"`
-	TriggerKill        bool
-	Version            string             `json:"Version"`
-	IndexEngineVersion IndexEngineVersion `json:"IndexEngineVersion,omitempty"`
-	LeaseID            *clientv3.LeaseID  `json:"LeaseID,omitempty"`
+	ServerID                 int64  `json:"ServerID,omitempty"`
+	ServerName               string `json:"ServerName,omitempty"`
+	Address                  string `json:"Address,omitempty"`
+	Exclusive                bool   `json:"Exclusive,omitempty"`
+	Stopping                 bool   `json:"Stopping,omitempty"`
+	TriggerKill              bool
+	Version                  string             `json:"Version"`
+	IndexEngineVersion       IndexEngineVersion `json:"IndexEngineVersion,omitempty"`
+	ScalarIndexEngineVersion IndexEngineVersion `json:"ScalarIndexEngineVersion,omitempty"`
+	LeaseID                  *clientv3.LeaseID  `json:"LeaseID,omitempty"`
 
 	HostName     string            `json:"HostName,omitempty"`
 	EnableDisk   bool              `json:"EnableDisk,omitempty"`
@@ -180,6 +182,14 @@ func WithIndexEngineVersion(minimal, current int32) SessionOption {
 	return func(session *Session) {
 		session.IndexEngineVersion.MinimalIndexVersion = minimal
 		session.IndexEngineVersion.CurrentIndexVersion = current
+	}
+}
+
+// WithScalarIndexEngineVersion should be only used by querynode.
+func WithScalarIndexEngineVersion(minimal, current int32) SessionOption {
+	return func(session *Session) {
+		session.ScalarIndexEngineVersion.MinimalIndexVersion = minimal
+		session.ScalarIndexEngineVersion.CurrentIndexVersion = current
 	}
 }
 

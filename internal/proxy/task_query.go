@@ -76,10 +76,11 @@ type queryTask struct {
 }
 
 type queryParams struct {
-	limit      int64
-	offset     int64
-	reduceType reduce.IReduceType
-	isIterator bool
+	limit        int64
+	offset       int64
+	reduceType   reduce.IReduceType
+	isIterator   bool
+	collectionID int64
 }
 
 // translateToOutputFieldIDs translates output fields name to output fields id.
@@ -146,6 +147,7 @@ func parseQueryParams(queryParamsPair []*commonpb.KeyValuePair) (*queryParams, e
 		reduceStopForBest bool
 		isIterator        bool
 		err               error
+		collectionID      int64
 	)
 	reduceStopForBestStr, err := funcutil.GetAttrByKeyFromRepeatedKV(ReduceStopForBestKey, queryParamsPair)
 	// if reduce_stop_for_best is provided
@@ -164,6 +166,15 @@ func parseQueryParams(queryParamsPair []*commonpb.KeyValuePair) (*queryParams, e
 		if err != nil {
 			return nil, merr.WrapErrParameterInvalid("true or false", isIteratorStr,
 				"value for iterator field is invalid")
+		}
+	}
+
+	collectionIdStr, err := funcutil.GetAttrByKeyFromRepeatedKV(CollectionID, queryParamsPair)
+	if err == nil {
+		collectionID, err = strconv.ParseInt(collectionIdStr, 0, 64)
+		if err != nil {
+			return nil, merr.WrapErrParameterInvalid("int value for collection_id", CollectionID,
+				"value for collection id is invalid")
 		}
 	}
 
@@ -201,10 +212,11 @@ func parseQueryParams(queryParamsPair []*commonpb.KeyValuePair) (*queryParams, e
 	}
 
 	return &queryParams{
-		limit:      limit,
-		offset:     offset,
-		reduceType: reduceType,
-		isIterator: isIterator,
+		limit:        limit,
+		offset:       offset,
+		reduceType:   reduceType,
+		isIterator:   isIterator,
+		collectionID: collectionID,
 	}, nil
 }
 
@@ -347,22 +359,17 @@ func (t *queryTask) PreExecute(ctx context.Context) error {
 	log.Debug("Validate partition names.")
 
 	// fetch search_growing from query param
-	var ignoreGrowing bool
-	for i, kv := range t.request.GetQueryParams() {
-		if kv.GetKey() == IgnoreGrowingKey {
-			ignoreGrowing, err = strconv.ParseBool(kv.Value)
-			if err != nil {
-				return errors.New("parse search growing failed")
-			}
-			t.request.QueryParams = append(t.request.GetQueryParams()[:i], t.request.GetQueryParams()[i+1:]...)
-			break
-		}
+	if t.RetrieveRequest.IgnoreGrowing, err = isIgnoreGrowing(t.request.GetQueryParams()); err != nil {
+		return err
 	}
-	t.RetrieveRequest.IgnoreGrowing = ignoreGrowing
 
 	queryParams, err := parseQueryParams(t.request.GetQueryParams())
 	if err != nil {
 		return err
+	}
+	if queryParams.collectionID > 0 && queryParams.collectionID != t.GetCollectionID() {
+		return merr.WrapErrAsInputError(merr.WrapErrParameterInvalidMsg("Input collection id is not consistent to collectionID in the context," +
+			"alias or database may have changed"))
 	}
 	if queryParams.reduceType == reduce.IReduceInOrderForBest {
 		t.RetrieveRequest.ReduceStopForBest = true
@@ -447,6 +454,7 @@ func (t *queryTask) PreExecute(ctx context.Context) error {
 	guaranteeTs := t.request.GetGuaranteeTimestamp()
 	var consistencyLevel commonpb.ConsistencyLevel
 	useDefaultConsistency := t.request.GetUseDefaultConsistency()
+	t.RetrieveRequest.ConsistencyLevel = t.request.GetConsistencyLevel()
 	if useDefaultConsistency {
 		consistencyLevel = collectionInfo.consistencyLevel
 		guaranteeTs = parseGuaranteeTsFromConsistency(guaranteeTs, t.BeginTs(), consistencyLevel)
@@ -466,6 +474,7 @@ func (t *queryTask) PreExecute(ctx context.Context) error {
 		t.MvccTimestamp = t.request.GetGuaranteeTimestamp()
 		t.GuaranteeTimestamp = t.request.GetGuaranteeTimestamp()
 	}
+	t.RetrieveRequest.IsIterator = queryParams.isIterator
 
 	deadline, ok := t.TraceCtx().Deadline()
 	if ok {

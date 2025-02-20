@@ -165,7 +165,7 @@ func TestDmlChannels(t *testing.T) {
 	defer paramtable.Get().Reset(Params.CommonCfg.PreCreatedTopicEnabled.Key)
 	defer paramtable.Get().Reset(Params.CommonCfg.TopicNames.Key)
 
-	assert.Panics(t, func() { newDmlChannels(ctx, factory, dmlChanPrefix, totalDmlChannelNum) })
+	newDmlChannels(ctx, factory, dmlChanPrefix, totalDmlChannelNum)
 }
 
 func TestDmChannelsFailure(t *testing.T) {
@@ -277,10 +277,11 @@ type FailMsgStream struct {
 	errBroadcast bool
 }
 
-func (ms *FailMsgStream) Close()                                            {}
-func (ms *FailMsgStream) Chan() <-chan *msgstream.MsgPack                   { return nil }
-func (ms *FailMsgStream) AsProducer(ctx context.Context, channels []string) {}
-func (ms *FailMsgStream) AsReader(channels []string, subName string)        {}
+func (ms *FailMsgStream) Close()                                                {}
+func (ms *FailMsgStream) Chan() <-chan *msgstream.ConsumeMsgPack                { return nil }
+func (ms *FailMsgStream) GetUnmarshalDispatcher() msgstream.UnmarshalDispatcher { return nil }
+func (ms *FailMsgStream) AsProducer(ctx context.Context, channels []string)     {}
+func (ms *FailMsgStream) AsReader(channels []string, subName string)            {}
 func (ms *FailMsgStream) AsConsumer(ctx context.Context, channels []string, subName string, position common.SubscriptionInitialPosition) error {
 	return nil
 }

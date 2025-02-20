@@ -27,7 +27,7 @@ import (
 	"github.com/milvus-io/milvus/internal/datacoord/allocator"
 	"github.com/milvus-io/milvus/pkg/log"
 	"github.com/milvus-io/milvus/pkg/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/util/lock"
+	"github.com/milvus-io/milvus/pkg/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/util/logutil"
 )
 
@@ -41,10 +41,30 @@ const (
 	TriggerTypeSingle
 )
 
+func (t CompactionTriggerType) String() string {
+	switch t {
+	case TriggerTypeLevelZeroViewChange:
+		return "LevelZeroViewChange"
+	case TriggerTypeLevelZeroViewIDLE:
+		return "LevelZeroViewIDLE"
+	case TriggerTypeSegmentSizeViewChange:
+		return "SegmentSizeViewChange"
+	case TriggerTypeClustering:
+		return "Clustering"
+	case TriggerTypeSingle:
+		return "Single"
+	default:
+		return ""
+	}
+}
+
 type TriggerManager interface {
 	Start()
 	Stop()
+	OnCollectionUpdate(collectionID int64)
 	ManualTrigger(ctx context.Context, collectionID int64, clusteringCompaction bool) (UniqueID, error)
+	GetPauseCompactionChan(jobID, collectionID int64) <-chan struct{}
+	GetResumeCompactionChan(jobID, collectionID int64) <-chan struct{}
 }
 
 var _ TriggerManager = (*CompactionTriggerManager)(nil)
@@ -64,51 +84,127 @@ type CompactionTriggerManager struct {
 	handler           Handler
 	allocator         allocator.Allocator
 
-	view *FullViews
-	// todo handle this lock
-	viewGuard lock.RWMutex
-
 	meta             *meta
+	imeta            ImportMeta
 	l0Policy         *l0CompactionPolicy
 	clusteringPolicy *clusteringCompactionPolicy
 	singlePolicy     *singleCompactionPolicy
 
-	closeSig chan struct{}
-	closeWg  sync.WaitGroup
+	cancel  context.CancelFunc
+	closeWg sync.WaitGroup
+
+	l0Triggering bool
+	l0SigLock    *sync.Mutex
+	l0TickSig    *sync.Cond
+
+	pauseCompactionChanMap  map[int64]chan struct{}
+	resumeCompactionChanMap map[int64]chan struct{}
+	compactionChanLock      sync.Mutex
 }
 
-func NewCompactionTriggerManager(alloc allocator.Allocator, handler Handler, compactionHandler compactionPlanContext, meta *meta) *CompactionTriggerManager {
+func NewCompactionTriggerManager(alloc allocator.Allocator, handler Handler, compactionHandler compactionPlanContext, meta *meta, imeta ImportMeta) *CompactionTriggerManager {
 	m := &CompactionTriggerManager{
-		allocator:         alloc,
-		handler:           handler,
-		compactionHandler: compactionHandler,
-		view: &FullViews{
-			collections: make(map[int64][]*SegmentView),
-		},
-		meta:     meta,
-		closeSig: make(chan struct{}),
+		allocator:               alloc,
+		handler:                 handler,
+		compactionHandler:       compactionHandler,
+		meta:                    meta,
+		imeta:                   imeta,
+		pauseCompactionChanMap:  make(map[int64]chan struct{}),
+		resumeCompactionChanMap: make(map[int64]chan struct{}),
 	}
+	m.l0SigLock = &sync.Mutex{}
+	m.l0TickSig = sync.NewCond(m.l0SigLock)
 	m.l0Policy = newL0CompactionPolicy(meta)
 	m.clusteringPolicy = newClusteringCompactionPolicy(meta, m.allocator, m.handler)
 	m.singlePolicy = newSingleCompactionPolicy(meta, m.allocator, m.handler)
 	return m
 }
 
+// OnCollectionUpdate notifies L0Policy about latest collection's L0 segment changes
+// This tells the l0 triggers about which collections are active
+func (m *CompactionTriggerManager) OnCollectionUpdate(collectionID int64) {
+	m.l0Policy.OnCollectionUpdate(collectionID)
+}
+
 func (m *CompactionTriggerManager) Start() {
 	m.closeWg.Add(1)
-	go m.startLoop()
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancel = cancel
+	go func() {
+		defer m.closeWg.Done()
+		m.loop(ctx)
+	}()
 }
 
 func (m *CompactionTriggerManager) Stop() {
-	close(m.closeSig)
+	if m.cancel != nil {
+		m.cancel()
+	}
 	m.closeWg.Wait()
 }
 
-func (m *CompactionTriggerManager) startLoop() {
-	defer logutil.LogPanic()
-	defer m.closeWg.Done()
+func (m *CompactionTriggerManager) pauseL0SegmentCompacting(jobID, collectionID int64) {
+	m.l0Policy.AddSkipCollection(collectionID)
+	m.l0SigLock.Lock()
+	for m.l0Triggering {
+		m.l0TickSig.Wait()
+	}
+	m.l0SigLock.Unlock()
+	m.compactionChanLock.Lock()
+	if ch, ok := m.pauseCompactionChanMap[jobID]; ok {
+		close(ch)
+	}
+	m.compactionChanLock.Unlock()
+}
 
-	log := log.Ctx(context.TODO())
+func (m *CompactionTriggerManager) resumeL0SegmentCompacting(jobID, collectionID int64) {
+	m.compactionChanLock.Lock()
+	m.l0Policy.RemoveSkipCollection(collectionID)
+	if ch, ok := m.resumeCompactionChanMap[jobID]; ok {
+		close(ch)
+		delete(m.pauseCompactionChanMap, jobID)
+		delete(m.resumeCompactionChanMap, jobID)
+	}
+	m.compactionChanLock.Unlock()
+}
+
+func (m *CompactionTriggerManager) GetPauseCompactionChan(jobID, collectionID int64) <-chan struct{} {
+	m.compactionChanLock.Lock()
+	defer m.compactionChanLock.Unlock()
+	if ch, ok := m.pauseCompactionChanMap[jobID]; ok {
+		return ch
+	}
+	ch := make(chan struct{})
+	m.pauseCompactionChanMap[jobID] = ch
+	go m.pauseL0SegmentCompacting(jobID, collectionID)
+	return ch
+}
+
+func (m *CompactionTriggerManager) GetResumeCompactionChan(jobID, collectionID int64) <-chan struct{} {
+	m.compactionChanLock.Lock()
+	defer m.compactionChanLock.Unlock()
+	if ch, ok := m.resumeCompactionChanMap[jobID]; ok {
+		return ch
+	}
+	ch := make(chan struct{})
+	m.resumeCompactionChanMap[jobID] = ch
+	go m.resumeL0SegmentCompacting(jobID, collectionID)
+	return ch
+}
+
+func (m *CompactionTriggerManager) setL0Triggering(b bool) {
+	m.l0SigLock.Lock()
+	defer m.l0SigLock.Unlock()
+	m.l0Triggering = b
+	if !b {
+		m.l0TickSig.Broadcast()
+	}
+}
+
+func (m *CompactionTriggerManager) loop(ctx context.Context) {
+	defer logutil.LogPanic()
+
+	log := log.Ctx(ctx)
 	l0Ticker := time.NewTicker(Params.DataCoordCfg.L0CompactionTriggerInterval.GetAsDuration(time.Second))
 	defer l0Ticker.Stop()
 	clusteringTicker := time.NewTicker(Params.DataCoordCfg.ClusteringCompactionTriggerInterval.GetAsDuration(time.Second))
@@ -118,7 +214,7 @@ func (m *CompactionTriggerManager) startLoop() {
 	log.Info("Compaction trigger manager start")
 	for {
 		select {
-		case <-m.closeSig:
+		case <-ctx.Done():
 			log.Info("Compaction trigger manager checkLoop quit")
 			return
 		case <-l0Ticker.C:
@@ -129,17 +225,19 @@ func (m *CompactionTriggerManager) startLoop() {
 				log.RatedInfo(10, "Skip trigger l0 compaction since compactionHandler is full")
 				continue
 			}
+			m.setL0Triggering(true)
 			events, err := m.l0Policy.Trigger()
 			if err != nil {
 				log.Warn("Fail to trigger L0 policy", zap.Error(err))
+				m.setL0Triggering(false)
 				continue
 			}
-			ctx := context.Background()
 			if len(events) > 0 {
 				for triggerType, views := range events {
 					m.notify(ctx, triggerType, views)
 				}
 			}
+			m.setL0Triggering(false)
 		case <-clusteringTicker.C:
 			if !m.clusteringPolicy.Enable() {
 				continue
@@ -148,12 +246,11 @@ func (m *CompactionTriggerManager) startLoop() {
 				log.RatedInfo(10, "Skip trigger clustering compaction since compactionHandler is full")
 				continue
 			}
-			events, err := m.clusteringPolicy.Trigger()
+			events, err := m.clusteringPolicy.Trigger(ctx)
 			if err != nil {
 				log.Warn("Fail to trigger clustering policy", zap.Error(err))
 				continue
 			}
-			ctx := context.Background()
 			if len(events) > 0 {
 				for triggerType, views := range events {
 					m.notify(ctx, triggerType, views)
@@ -167,12 +264,11 @@ func (m *CompactionTriggerManager) startLoop() {
 				log.RatedInfo(10, "Skip trigger single compaction since compactionHandler is full")
 				continue
 			}
-			events, err := m.singlePolicy.Trigger()
+			events, err := m.singlePolicy.Trigger(ctx)
 			if err != nil {
 				log.Warn("Fail to trigger single policy", zap.Error(err))
 				continue
 			}
-			ctx := context.Background()
 			if len(events) > 0 {
 				for triggerType, views := range events {
 					m.notify(ctx, triggerType, views)
@@ -184,7 +280,7 @@ func (m *CompactionTriggerManager) startLoop() {
 
 func (m *CompactionTriggerManager) ManualTrigger(ctx context.Context, collectionID int64, clusteringCompaction bool) (UniqueID, error) {
 	log.Ctx(ctx).Info("receive manual trigger", zap.Int64("collectionID", collectionID))
-	views, triggerID, err := m.clusteringPolicy.triggerOneCollection(context.Background(), collectionID, true)
+	views, triggerID, err := m.clusteringPolicy.triggerOneCollection(ctx, collectionID, true)
 	if err != nil {
 		return 0, err
 	}
@@ -200,47 +296,26 @@ func (m *CompactionTriggerManager) ManualTrigger(ctx context.Context, collection
 
 func (m *CompactionTriggerManager) notify(ctx context.Context, eventType CompactionTriggerType, views []CompactionView) {
 	log := log.Ctx(ctx)
+	log.Debug("Start to trigger compactions", zap.String("eventType", eventType.String()))
 	for _, view := range views {
-		switch eventType {
-		case TriggerTypeLevelZeroViewChange:
-			log.Debug("Start to trigger a level zero compaction by TriggerTypeLevelZeroViewChange")
-			outView, reason := view.Trigger()
-			if outView != nil {
-				log.Info("Success to trigger a LevelZeroCompaction output view, try to submit",
-					zap.String("reason", reason),
-					zap.String("output view", outView.String()))
-				m.SubmitL0ViewToScheduler(ctx, outView)
-			}
-		case TriggerTypeLevelZeroViewIDLE:
-			log.Debug("Start to trigger a level zero compaction by TriggerTypLevelZeroViewIDLE")
-			outView, reason := view.Trigger()
-			if outView == nil {
-				log.Info("Start to force trigger a level zero compaction by TriggerTypLevelZeroViewIDLE")
-				outView, reason = view.ForceTrigger()
-			}
+		outView, reason := view.Trigger()
+		if outView == nil && eventType == TriggerTypeLevelZeroViewIDLE {
+			log.Info("Start to force trigger a level zero compaction")
+			outView, reason = view.ForceTrigger()
+		}
 
-			if outView != nil {
-				log.Info("Success to trigger a LevelZeroCompaction output view, try to submit",
-					zap.String("reason", reason),
-					zap.String("output view", outView.String()))
+		if outView != nil {
+			log.Info("Success to trigger a compaction, try to submit",
+				zap.String("eventType", eventType.String()),
+				zap.String("reason", reason),
+				zap.String("output view", outView.String()))
+
+			switch eventType {
+			case TriggerTypeLevelZeroViewChange, TriggerTypeLevelZeroViewIDLE:
 				m.SubmitL0ViewToScheduler(ctx, outView)
-			}
-		case TriggerTypeClustering:
-			log.Debug("Start to trigger a clustering compaction by TriggerTypeClustering")
-			outView, reason := view.Trigger()
-			if outView != nil {
-				log.Info("Success to trigger a ClusteringCompaction output view, try to submit",
-					zap.String("reason", reason),
-					zap.String("output view", outView.String()))
+			case TriggerTypeClustering:
 				m.SubmitClusteringViewToScheduler(ctx, outView)
-			}
-		case TriggerTypeSingle:
-			log.Debug("Start to trigger a single compaction by TriggerTypeSingle")
-			outView, reason := view.Trigger()
-			if outView != nil {
-				log.Info("Success to trigger a MixCompaction output view, try to submit",
-					zap.String("reason", reason),
-					zap.String("output view", outView.String()))
+			case TriggerTypeSingle:
 				m.SubmitSingleViewToScheduler(ctx, outView)
 			}
 		}
@@ -262,6 +337,12 @@ func (m *CompactionTriggerManager) SubmitL0ViewToScheduler(ctx context.Context, 
 	collection, err := m.handler.GetCollection(ctx, view.GetGroupLabel().CollectionID)
 	if err != nil {
 		log.Warn("Failed to submit compaction view to scheduler because get collection fail", zap.Error(err))
+		return
+	}
+
+	err = m.addL0ImportTaskForImport(ctx, collection, view)
+	if err != nil {
+		log.Warn("Failed to submit compaction view to scheduler because add l0 import task fail", zap.Error(err))
 		return
 	}
 
@@ -295,6 +376,75 @@ func (m *CompactionTriggerManager) SubmitL0ViewToScheduler(ctx context.Context, 
 		zap.String("type", task.GetType().String()),
 		zap.Int64s("L0 segments", levelZeroSegs),
 	)
+}
+
+func (m *CompactionTriggerManager) addL0ImportTaskForImport(ctx context.Context, collection *collectionInfo, view CompactionView) error {
+	// add l0 import task for the collection if the collection is importing
+	importJobs := m.imeta.GetJobBy(ctx, WithCollectionID(collection.ID), WithoutJobStates(internalpb.ImportJobState_Completed, internalpb.ImportJobState_Failed))
+	if len(importJobs) > 0 {
+		partitionID := view.GetGroupLabel().PartitionID
+		var (
+			fileSize        int64 = 0
+			totalRows       int64 = 0
+			totalMemorySize int64 = 0
+			importPaths     []string
+		)
+		idStart := time.Now().UnixMilli()
+		for _, segmentView := range view.GetSegmentsView() {
+			segInfo := m.meta.GetSegment(ctx, segmentView.ID)
+			if segInfo == nil {
+				continue
+			}
+			totalRows += int64(segmentView.DeltaRowCount)
+			totalMemorySize += int64(segmentView.DeltaSize)
+			for _, deltaLogs := range segInfo.GetDeltalogs() {
+				for _, binlog := range deltaLogs.GetBinlogs() {
+					fileSize += binlog.GetLogSize()
+					importPaths = append(importPaths, binlog.GetLogPath())
+				}
+			}
+		}
+
+		for i, job := range importJobs {
+			newTasks, err := NewImportTasks([][]*datapb.ImportFileStats{
+				{
+					{
+						ImportFile: &internalpb.ImportFile{
+							Id:    idStart + int64(i),
+							Paths: importPaths,
+						},
+						FileSize:        fileSize,
+						TotalRows:       totalRows,
+						TotalMemorySize: totalMemorySize,
+						HashedStats: map[string]*datapb.PartitionImportStats{
+							// which is vchannel
+							view.GetGroupLabel().Channel: {
+								PartitionRows: map[int64]int64{
+									partitionID: totalRows,
+								},
+								PartitionDataSize: map[int64]int64{
+									partitionID: totalMemorySize,
+								},
+							},
+						},
+					},
+				},
+			}, job, m.allocator, m.meta)
+			if err != nil {
+				log.Warn("new import tasks failed", zap.Error(err))
+				return err
+			}
+			for _, t := range newTasks {
+				err = m.imeta.AddTask(ctx, t)
+				if err != nil {
+					log.Warn("add new l0 import task from l0 compaction failed", WrapTaskLog(t, zap.Error(err))...)
+					return err
+				}
+				log.Info("add new l0 import task from l0 compaction", WrapTaskLog(t)...)
+			}
+		}
+	}
+	return nil
 }
 
 func (m *CompactionTriggerManager) SubmitClusteringViewToScheduler(ctx context.Context, view CompactionView) {

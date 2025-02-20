@@ -120,7 +120,7 @@ func (it *indexBuildTask) GetFailReason() string {
 	return it.taskInfo.FailReason
 }
 
-func (it *indexBuildTask) UpdateVersion(ctx context.Context, nodeID int64, meta *meta) error {
+func (it *indexBuildTask) UpdateVersion(ctx context.Context, nodeID int64, meta *meta, compactionHandler compactionPlanContext) error {
 	if err := meta.indexMeta.UpdateVersion(it.taskID, nodeID); err != nil {
 		return err
 	}
@@ -236,34 +236,37 @@ func (it *indexBuildTask) PreCheck(ctx context.Context, dependency *taskSchedule
 	}
 
 	it.req = &workerpb.CreateJobRequest{
-		ClusterID:             Params.CommonCfg.ClusterPrefix.GetValue(),
-		IndexFilePrefix:       path.Join(dependency.chunkManager.RootPath(), common.SegmentIndexPath),
-		BuildID:               it.taskID,
-		IndexVersion:          segIndex.IndexVersion + 1,
-		StorageConfig:         createStorageConfig(),
-		IndexParams:           indexParams,
-		TypeParams:            typeParams,
-		NumRows:               segIndex.NumRows,
-		CurrentIndexVersion:   dependency.indexEngineVersionManager.GetCurrentIndexEngineVersion(),
-		CollectionID:          segment.GetCollectionID(),
-		PartitionID:           segment.GetPartitionID(),
-		SegmentID:             segment.GetID(),
-		FieldID:               fieldID,
-		FieldName:             field.GetName(),
-		FieldType:             field.GetDataType(),
-		Dim:                   int64(dim),
-		DataIds:               binlogIDs,
-		OptionalScalarFields:  optionalFields,
-		Field:                 field,
-		PartitionKeyIsolation: partitionKeyIsolation,
+		ClusterID:                 Params.CommonCfg.ClusterPrefix.GetValue(),
+		IndexFilePrefix:           path.Join(dependency.chunkManager.RootPath(), common.SegmentIndexPath),
+		BuildID:                   it.taskID,
+		IndexVersion:              segIndex.IndexVersion + 1,
+		StorageConfig:             createStorageConfig(),
+		IndexParams:               indexParams,
+		TypeParams:                typeParams,
+		NumRows:                   segIndex.NumRows,
+		CurrentIndexVersion:       dependency.indexEngineVersionManager.GetCurrentIndexEngineVersion(),
+		CurrentScalarIndexVersion: dependency.indexEngineVersionManager.GetCurrentScalarIndexEngineVersion(),
+		CollectionID:              segment.GetCollectionID(),
+		PartitionID:               segment.GetPartitionID(),
+		SegmentID:                 segment.GetID(),
+		FieldID:                   fieldID,
+		FieldName:                 field.GetName(),
+		FieldType:                 field.GetDataType(),
+		Dim:                       int64(dim),
+		DataIds:                   binlogIDs,
+		OptionalScalarFields:      optionalFields,
+		Field:                     field,
+		PartitionKeyIsolation:     partitionKeyIsolation,
 	}
 
 	log.Ctx(ctx).Info("index task pre check successfully", zap.Int64("taskID", it.GetTaskID()),
-		zap.Int64("segID", segment.GetID()))
+		zap.Int64("segID", segment.GetID()),
+		zap.Int32("CurrentIndexVersion", it.req.GetCurrentIndexVersion()),
+		zap.Int32("CurrentScalarIndexVersion", it.req.GetCurrentScalarIndexVersion()))
 	return true
 }
 
-func (it *indexBuildTask) AssignTask(ctx context.Context, client types.IndexNodeClient) bool {
+func (it *indexBuildTask) AssignTask(ctx context.Context, client types.IndexNodeClient, meta *meta) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), reqTimeoutInterval)
 	defer cancel()
 	resp, err := client.CreateJobV2(ctx, &workerpb.CreateJobV2Request{

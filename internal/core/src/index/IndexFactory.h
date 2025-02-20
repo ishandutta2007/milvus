@@ -21,6 +21,7 @@
 #include <mutex>
 #include <shared_mutex>
 
+#include "common/Types.h"
 #include "common/type_c.h"
 #include "index/Index.h"
 #include "index/ScalarIndex.h"
@@ -85,14 +86,14 @@ class IndexFactory {
     IndexBasePtr
     CreatePrimitiveScalarIndex(
         DataType data_type,
-        IndexType index_type,
+        const CreateIndexInfo& create_index_info,
         const storage::FileManagerContext& file_manager_context =
             storage::FileManagerContext());
 
     // For types like array, struct, union, etc
     IndexBasePtr
     CreateCompositeScalarIndex(
-        IndexType index_type,
+        const CreateIndexInfo& create_index_info,
         const storage::FileManagerContext& file_manager_context =
             storage::FileManagerContext());
 
@@ -102,6 +103,13 @@ class IndexFactory {
         IndexType index_type,
         const storage::FileManagerContext& file_manager_context =
             storage::FileManagerContext());
+
+    IndexBasePtr
+    CreateJsonIndex(IndexType index_type,
+                    DataType cast_dtype,
+                    const std::string& nested_path,
+                    const storage::FileManagerContext& file_manager_context =
+                        storage::FileManagerContext());
 
     IndexBasePtr
     CreateScalarIndex(const CreateIndexInfo& create_index_info,
@@ -115,7 +123,7 @@ class IndexFactory {
 
     template <typename T>
     ScalarIndexPtr<T>
-    CreatePrimitiveScalarIndex(const IndexType& index_type,
+    CreatePrimitiveScalarIndex(const CreateIndexInfo& create_index_info,
                                const storage::FileManagerContext& file_manager =
                                    storage::FileManagerContext());
 };

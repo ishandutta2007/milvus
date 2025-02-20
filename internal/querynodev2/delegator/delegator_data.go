@@ -728,7 +728,15 @@ func (sd *shardDelegator) createStreamFromMsgStream(ctx context.Context, positio
 	if err != nil {
 		return nil, stream.Close, err
 	}
-	return stream.Chan(), stream.Close, nil
+
+	dispatcher := msgstream.NewSimpleMsgDispatcher(stream, func(pm msgstream.ConsumeMsg) bool {
+		if pm.GetType() != commonpb.MsgType_Delete || pm.GetVChannel() != vchannelName {
+			return false
+		}
+		return true
+	})
+
+	return dispatcher.Chan(), dispatcher.Close, nil
 }
 
 func (sd *shardDelegator) createDeleteStreamFromStreamingService(ctx context.Context, position *msgpb.MsgPosition) (ch <-chan *msgstream.MsgPack, closer func(), err error) {
@@ -1003,12 +1011,12 @@ func (sd *shardDelegator) buildBM25IDF(req *internalpb.SearchRequest) (float64, 
 	proto.Unmarshal(req.GetPlaceholderGroup(), pb)
 
 	if len(pb.Placeholders) != 1 || len(pb.Placeholders[0].Values) == 0 {
-		return 0, merr.WrapErrParameterInvalidMsg("please provide varchar for BM25 Function based search")
+		return 0, merr.WrapErrParameterInvalidMsg("please provide varchar/text for BM25 Function based search")
 	}
 
 	holder := pb.Placeholders[0]
 	if holder.Type != commonpb.PlaceholderType_VarChar {
-		return 0, merr.WrapErrParameterInvalidMsg(fmt.Sprintf("please provide varchar for BM25 Function based search, got %s", holder.Type.String()))
+		return 0, merr.WrapErrParameterInvalidMsg(fmt.Sprintf("please provide varchar/text for BM25 Function based search, got %s", holder.Type.String()))
 	}
 
 	str := funcutil.GetVarCharFromPlaceholder(holder)
