@@ -1522,6 +1522,7 @@ type proxyConfig struct {
 	SkipPartitionKeyCheck        ParamItem `refreshable:"true"`
 	MaxVarCharLength             ParamItem `refreshable:"false"`
 	MaxTextLength                ParamItem `refreshable:"false"`
+	MaxResultEntries             ParamItem `refreshable:"true"`
 
 	AccessLog AccessLogConfig
 
@@ -1881,7 +1882,7 @@ please adjust in embedded Milvus: false`,
 	p.RetryTimesOnReplica = ParamItem{
 		Key:          "proxy.retryTimesOnReplica",
 		Version:      "2.3.0",
-		DefaultValue: "2",
+		DefaultValue: "5",
 		Doc:          "retry times on each replica",
 	}
 	p.RetryTimesOnReplica.Init(base.mgr)
@@ -1942,6 +1943,17 @@ please adjust in embedded Milvus: false`,
 		Doc:          "maximum number of characters for a row of the text field",
 	}
 	p.MaxTextLength.Init(base.mgr)
+
+	p.MaxResultEntries = ParamItem{
+		Key:          "proxy.maxResultEntries",
+		Version:      "2.6.0",
+		DefaultValue: strconv.Itoa(1000000),
+		Doc: `maximum number of result entries, typically Nq * TopK * GroupSize. 
+It costs additional memory and time to process a large number of result entries. 
+If the number of result entries exceeds this limit, the search will be rejected.`,
+		Export: true,
+	}
+	p.MaxResultEntries.Init(base.mgr)
 
 	p.GracefulStopTimeout = ParamItem{
 		Key:          "proxy.gracefulStopTimeout",
@@ -5560,6 +5572,7 @@ type streamingConfig struct {
 	WALBalancerTriggerInterval        ParamItem `refreshable:"true"`
 	WALBalancerBackoffInitialInterval ParamItem `refreshable:"true"`
 	WALBalancerBackoffMultiplier      ParamItem `refreshable:"true"`
+	WALBalancerOperationTimeout       ParamItem `refreshable:"true"`
 
 	// balancer Policy
 	WALBalancerPolicyName                           ParamItem `refreshable:"true"`
@@ -5625,6 +5638,15 @@ It's ok to set it into duration string, such as 30s or 1m30s, see time.ParseDura
 		Export:       true,
 	}
 	p.WALBalancerBackoffMultiplier.Init(base.mgr)
+	p.WALBalancerOperationTimeout = ParamItem{
+		Key:     "streaming.walBalancer.operationTimeout",
+		Version: "2.6.0",
+		Doc: `The timeout of wal balancer operation, 10s by default.
+If the operation exceeds this timeout, it will be canceled.`,
+		DefaultValue: "10s",
+		Export:       true,
+	}
+	p.WALBalancerOperationTimeout.Init(base.mgr)
 
 	p.WALBalancerPolicyName = ParamItem{
 		Key:          "streaming.walBalancer.balancePolicy.name",
