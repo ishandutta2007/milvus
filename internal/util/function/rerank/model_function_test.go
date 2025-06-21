@@ -339,6 +339,68 @@ func (s *RerankModelSuite) TestNewModelFunction() {
 	}
 }
 
+func (s *RerankModelSuite) TestParseParams() {
+	{
+		params := []*commonpb.KeyValuePair{
+			{Key: providerParamName, Value: "tei"},
+			{Key: function.EndpointParamKey, Value: "mock"},
+			{Key: queryKeyName, Value: `["q1"]`},
+		}
+		_, _, _, err := parseParams(params)
+		s.ErrorContains(err, "is not a valid http/https link")
+	}
+	{
+		params := []*commonpb.KeyValuePair{
+			{Key: providerParamName, Value: "tei"},
+			{Key: function.EndpointParamKey, Value: "http://localhost:9000"},
+			{Key: maxBatchKeyName, Value: "error"},
+		}
+		_, _, _, err := parseParams(params)
+		s.ErrorContains(err, "Rerank params error, maxBatch")
+	}
+
+	{
+		params := []*commonpb.KeyValuePair{
+			{Key: providerParamName, Value: "tei"},
+			{Key: function.EndpointParamKey, Value: "http://localhost:9000"},
+			{Key: maxBatchKeyName, Value: "100"},
+			{Key: vllmTruncateParamName, Value: "error"},
+		}
+		_, _, _, err := parseParams(params)
+		s.ErrorContains(err, "Rerank params error")
+	}
+
+	{
+		params := []*commonpb.KeyValuePair{
+			{Key: providerParamName, Value: "tei"},
+			{Key: function.EndpointParamKey, Value: "http://localhost:9000"},
+			{Key: maxBatchKeyName, Value: "100"},
+			{Key: vllmTruncateParamName, Value: "100"},
+			{Key: teiTruncationDirectionParamName, Value: "Left"},
+			{Key: tieTruncateParamName, Value: "error"},
+		}
+		_, _, _, err := parseParams(params)
+		s.ErrorContains(err, "Rerank params error")
+	}
+	{
+		params := []*commonpb.KeyValuePair{
+			{Key: providerParamName, Value: "tei"},
+			{Key: function.EndpointParamKey, Value: "http://localhost:9000"},
+			{Key: maxBatchKeyName, Value: "100"},
+			{Key: vllmTruncateParamName, Value: "101"},
+			{Key: teiTruncationDirectionParamName, Value: "Left"},
+			{Key: tieTruncateParamName, Value: "true"},
+		}
+		endpoint, maxBatch, truncateParams, err := parseParams(params)
+		s.NoError(err)
+		s.Equal("http://localhost:9000", endpoint)
+		s.Equal(100, maxBatch)
+		s.Equal(truncateParams[vllmTruncateParamName], int64(101))
+		s.Equal(truncateParams[teiTruncationDirectionParamName], "Left")
+		s.Equal(truncateParams[tieTruncateParamName], true)
+	}
+}
+
 func (s *RerankModelSuite) TestRerankProcess() {
 	schema := &schemapb.CollectionSchema{
 		Name: "test",
@@ -375,8 +437,8 @@ func (s *RerankModelSuite) TestRerankProcess() {
 			nq := int64(1)
 			f, err := newModelFunction(schema, functionSchema)
 			s.NoError(err)
-			inputs, _ := newRerankInputs([]*schemapb.SearchResultData{}, f.GetInputFieldIDs())
-			ret, err := f.Process(context.Background(), &SearchParams{nq, 3, 2, -1, -1, 1, false, []string{"COSINE"}}, inputs)
+			inputs, _ := newRerankInputs([]*schemapb.SearchResultData{}, f.GetInputFieldIDs(), false)
+			ret, err := f.Process(context.Background(), NewSearchParams(nq, 3, 2, -1, -1, 1, false, "", []string{"COSINE"}), inputs)
 			s.NoError(err)
 			s.Equal(int64(3), ret.searchResultData.TopK)
 			s.Equal([]int64{}, ret.searchResultData.Topks)
@@ -386,10 +448,10 @@ func (s *RerankModelSuite) TestRerankProcess() {
 		{
 			nq := int64(1)
 			f, err := newModelFunction(schema, functionSchema)
-			data := genSearchResultData(nq, 10, schemapb.DataType_Int64, "noExist", 1000)
+			data := function.GenSearchResultData(nq, 10, schemapb.DataType_Int64, "noExist", 1000)
 			s.NoError(err)
 
-			_, err = newRerankInputs([]*schemapb.SearchResultData{data}, f.GetInputFieldIDs())
+			_, err = newRerankInputs([]*schemapb.SearchResultData{data}, f.GetInputFieldIDs(), false)
 			s.ErrorContains(err, "Search reaults mismatch rerank inputs")
 		}
 	}
@@ -430,18 +492,18 @@ func (s *RerankModelSuite) TestRerankProcess() {
 		{
 			f, err := newModelFunction(schema, functionSchema)
 			s.NoError(err)
-			data := genSearchResultData(nq, 10, schemapb.DataType_VarChar, "text", 101)
-			inputs, _ := newRerankInputs([]*schemapb.SearchResultData{data}, f.GetInputFieldIDs())
-			_, err = f.Process(context.Background(), &SearchParams{nq, 3, 2, -1, -1, 1, false, []string{"COSINE"}}, inputs)
+			data := function.GenSearchResultData(nq, 10, schemapb.DataType_VarChar, "text", 101)
+			inputs, _ := newRerankInputs([]*schemapb.SearchResultData{data}, f.GetInputFieldIDs(), false)
+			_, err = f.Process(context.Background(), NewSearchParams(nq, 3, 2, -1, -1, 1, false, "", []string{"COSINE"}), inputs)
 			s.ErrorContains(err, "nq must equal to queries size, but got nq [1], queries size [2]")
 		}
 		{
 			functionSchema.Params[2].Value = `["q1"]`
 			f, err := newModelFunction(schema, functionSchema)
 			s.NoError(err)
-			data := genSearchResultData(nq, 10, schemapb.DataType_VarChar, "text", 101)
-			inputs, _ := newRerankInputs([]*schemapb.SearchResultData{data}, f.GetInputFieldIDs())
-			ret, err := f.Process(context.Background(), &SearchParams{nq, 3, 0, -1, -1, 1, false, []string{"COSINE"}}, inputs)
+			data := function.GenSearchResultData(nq, 10, schemapb.DataType_VarChar, "text", 101)
+			inputs, _ := newRerankInputs([]*schemapb.SearchResultData{data}, f.GetInputFieldIDs(), false)
+			ret, err := f.Process(context.Background(), NewSearchParams(nq, 3, 0, -1, -1, 1, false, "", []string{"COSINE"}), inputs)
 			s.NoError(err)
 			s.Equal([]int64{3}, ret.searchResultData.Topks)
 			s.Equal(int64(3), ret.searchResultData.TopK)
@@ -452,9 +514,9 @@ func (s *RerankModelSuite) TestRerankProcess() {
 			functionSchema.Params[2].Value = `["q1", "q2", "q3"]`
 			f, err := newModelFunction(schema, functionSchema)
 			s.NoError(err)
-			data := genSearchResultData(nq, 10, schemapb.DataType_VarChar, "text", 101)
-			inputs, _ := newRerankInputs([]*schemapb.SearchResultData{data}, f.GetInputFieldIDs())
-			ret, err := f.Process(context.Background(), &SearchParams{nq, 3, 2, -1, -1, 1, false, []string{"COSINE", "COSINE", "COSINE"}}, inputs)
+			data := function.GenSearchResultData(nq, 10, schemapb.DataType_VarChar, "text", 101)
+			inputs, _ := newRerankInputs([]*schemapb.SearchResultData{data}, f.GetInputFieldIDs(), false)
+			ret, err := f.Process(context.Background(), NewSearchParams(nq, 3, 2, -1, -1, 1, false, "", []string{"COSINE", "COSINE", "COSINE"}), inputs)
 			s.NoError(err)
 			s.Equal([]int64{3, 3, 3}, ret.searchResultData.Topks)
 			s.Equal(int64(3), ret.searchResultData.TopK)
@@ -468,11 +530,11 @@ func (s *RerankModelSuite) TestRerankProcess() {
 		functionSchema.Params[2].Value = `["q1"]`
 		f, err := newModelFunction(schema, functionSchema)
 		s.NoError(err)
-		data1 := genSearchResultData(nq, 10, schemapb.DataType_VarChar, "text", 101)
+		data1 := function.GenSearchResultData(nq, 10, schemapb.DataType_VarChar, "text", 101)
 		// empty
-		data2 := genSearchResultData(nq, 0, schemapb.DataType_VarChar, "text", 101)
-		inputs, _ := newRerankInputs([]*schemapb.SearchResultData{data1, data2}, f.GetInputFieldIDs())
-		ret, err := f.Process(context.Background(), &SearchParams{nq, 3, 2, -1, -1, 1, false, []string{"COSINE"}}, inputs)
+		data2 := function.GenSearchResultData(nq, 0, schemapb.DataType_VarChar, "text", 101)
+		inputs, _ := newRerankInputs([]*schemapb.SearchResultData{data1, data2}, f.GetInputFieldIDs(), false)
+		ret, err := f.Process(context.Background(), NewSearchParams(nq, 3, 2, -1, -1, 1, false, "", []string{"COSINE"}), inputs)
 		s.NoError(err)
 		s.Equal([]int64{3}, ret.searchResultData.Topks)
 		s.Equal(int64(3), ret.searchResultData.TopK)
@@ -483,11 +545,11 @@ func (s *RerankModelSuite) TestRerankProcess() {
 		f, err := newModelFunction(schema, functionSchema)
 		s.NoError(err)
 		// ts/id data: 0 - 9
-		data1 := genSearchResultData(nq, 10, schemapb.DataType_VarChar, "text", 101)
+		data1 := function.GenSearchResultData(nq, 10, schemapb.DataType_VarChar, "text", 101)
 		// ts/id data: 0 - 3
-		data2 := genSearchResultData(nq, 4, schemapb.DataType_VarChar, "text", 101)
-		inputs, _ := newRerankInputs([]*schemapb.SearchResultData{data1, data2}, f.GetInputFieldIDs())
-		ret, err := f.Process(context.Background(), &SearchParams{nq, 3, 2, -1, -1, 1, false, []string{"COSINE", "COSINE"}}, inputs)
+		data2 := function.GenSearchResultData(nq, 4, schemapb.DataType_VarChar, "text", 101)
+		inputs, _ := newRerankInputs([]*schemapb.SearchResultData{data1, data2}, f.GetInputFieldIDs(), false)
+		ret, err := f.Process(context.Background(), NewSearchParams(nq, 3, 2, -1, -1, 1, false, "", []string{"COSINE", "COSINE"}), inputs)
 		s.NoError(err)
 		s.Equal([]int64{3}, ret.searchResultData.Topks)
 		s.Equal(int64(3), ret.searchResultData.TopK)
@@ -498,10 +560,10 @@ func (s *RerankModelSuite) TestRerankProcess() {
 		functionSchema.Params[2].Value = `["q1", "q2", "q3"]`
 		f, err := newModelFunction(schema, functionSchema)
 		s.NoError(err)
-		data1 := genSearchResultData(nq, 10, schemapb.DataType_VarChar, "text", 101)
-		data2 := genSearchResultData(nq, 4, schemapb.DataType_VarChar, "text", 101)
-		inputs, _ := newRerankInputs([]*schemapb.SearchResultData{data1, data2}, f.GetInputFieldIDs())
-		ret, err := f.Process(context.Background(), &SearchParams{nq, 3, 2, 1, -1, 1, false, []string{"COSINE", "COSINE", "COSINE"}}, inputs)
+		data1 := function.GenSearchResultData(nq, 10, schemapb.DataType_VarChar, "text", 101)
+		data2 := function.GenSearchResultData(nq, 4, schemapb.DataType_VarChar, "text", 101)
+		inputs, _ := newRerankInputs([]*schemapb.SearchResultData{data1, data2}, f.GetInputFieldIDs(), false)
+		ret, err := f.Process(context.Background(), NewSearchParams(nq, 3, 2, 1, -1, 1, false, "", []string{"COSINE", "COSINE", "COSINE"}), inputs)
 		s.NoError(err)
 		s.Equal([]int64{3, 3, 3}, ret.searchResultData.Topks)
 		s.Equal(int64(3), ret.searchResultData.TopK)

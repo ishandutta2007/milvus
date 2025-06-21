@@ -261,7 +261,7 @@ def analyze_documents(texts, language="en"):
     # this is a trick to make the text match test case verification simple, because the long word can be still split
     if language in ["zh", "cn", "chinese"]:
         word_freq = Counter({word: count for word, count in word_freq.items() if 1< len(word) <= 3})
-    log.info(f"word freq {word_freq.most_common(10)}")
+    log.debug(f"word freq {word_freq.most_common(10)}")
     return word_freq
 
 
@@ -2519,6 +2519,7 @@ def gen_json_field_expressions_all_single_operator():
 
     return expressions
 
+
 def gen_field_expressions_all_single_operator_each_field(field = ct.default_int64_field_name):
     """
     Gen a list of filter in expression-format(as a string)
@@ -2677,6 +2678,7 @@ def gen_field_expressions_all_single_operator_each_field(field = ct.default_int6
         raise Exception("Invalid field name")
 
     return expressions
+
 
 def concatenate_uneven_arrays(arr1, arr2):
     """

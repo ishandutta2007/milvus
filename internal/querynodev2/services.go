@@ -303,6 +303,16 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 	})
 	delegator.AddExcludedSegments(growingInfo)
 
+	flushedInfo := lo.SliceToMap(channel.GetFlushedSegmentIds(), func(id int64) (int64, uint64) {
+		return id, typeutil.MaxTimestamp
+	})
+	delegator.AddExcludedSegments(flushedInfo)
+
+	droppedInfo := lo.SliceToMap(channel.GetDroppedSegmentIds(), func(id int64) (int64, uint64) {
+		return id, typeutil.MaxTimestamp
+	})
+	delegator.AddExcludedSegments(droppedInfo)
+
 	defer func() {
 		if err != nil {
 			// remove legacy growing
@@ -322,11 +332,46 @@ func (node *QueryNode) WatchDmChannels(ctx context.Context, req *querypb.WatchDm
 		log.Warn(msg, zap.Error(err))
 		return merr.Status(err), nil
 	}
-	position := &msgpb.MsgPosition{
-		ChannelName: channel.SeekPosition.ChannelName,
-		MsgID:       channel.SeekPosition.MsgID,
-		Timestamp:   channel.SeekPosition.Timestamp,
+
+	var position *msgpb.MsgPosition
+	deleteCheckpoint := channel.GetDeleteCheckpoint()
+	channelCheckpoint := channel.GetSeekPosition()
+	if deleteCheckpoint == nil {
+		// for compatibility with old version coord, which doesn't have delete checkpoint in VchannelInfo
+		log.Info("no delete checkpoint found, use seek position to seek",
+			zap.Time("seekPosition", tsoutil.PhysicalTime(channelCheckpoint.GetTimestamp())),
+		)
+		position = &msgpb.MsgPosition{
+			ChannelName: channelCheckpoint.GetChannelName(),
+			MsgID:       channelCheckpoint.GetMsgID(),
+			Timestamp:   channelCheckpoint.GetTimestamp(),
+		}
+	} else {
+		if channelCheckpoint.GetTimestamp() > deleteCheckpoint.GetTimestamp() {
+			msg := "channel seek position is greater than delete checkpoint, use delete checkpoint to seek"
+			log.Info(msg,
+				zap.Time("seekPosition", tsoutil.PhysicalTime(channelCheckpoint.GetTimestamp())),
+				zap.Time("deleteCheckpoint", tsoutil.PhysicalTime(deleteCheckpoint.GetTimestamp())),
+			)
+			position = &msgpb.MsgPosition{
+				ChannelName: deleteCheckpoint.GetChannelName(),
+				MsgID:       deleteCheckpoint.GetMsgID(),
+				Timestamp:   deleteCheckpoint.GetTimestamp(),
+			}
+		} else {
+			msg := "channel seek position is smaller than delete checkpoint, use seek position to seek"
+			log.Info(msg,
+				zap.Time("seekPosition", tsoutil.PhysicalTime(channelCheckpoint.GetTimestamp())),
+				zap.Time("deleteCheckpoint", tsoutil.PhysicalTime(deleteCheckpoint.GetTimestamp())),
+			)
+			position = &msgpb.MsgPosition{
+				ChannelName: channelCheckpoint.GetChannelName(),
+				MsgID:       channelCheckpoint.GetMsgID(),
+				Timestamp:   channelCheckpoint.GetTimestamp(),
+			}
+		}
 	}
+
 	err = pipeline.ConsumeMsgStream(ctx, position)
 	if err != nil {
 		err = merr.WrapErrServiceUnavailable(err.Error(), "InitPipelineFailed")
@@ -1284,6 +1329,7 @@ func (node *QueryNode) GetDataDistribution(ctx context.Context, req *querypb.Get
 		LeaderViews:     leaderViews,
 		LastModifyTs:    lastModifyTs,
 		MemCapacityInMB: float64(hardware.GetMemoryCount() / 1024 / 1024),
+		CpuNum:          int64(hardware.GetCPUNum()),
 	}, nil
 }
 

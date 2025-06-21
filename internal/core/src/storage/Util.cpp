@@ -1,4 +1,3 @@
-
 // Licensed to the LF AI & Data foundation under one
 // or more contributor license agreements. See the NOTICE file
 // distributed with this work for additional information
@@ -18,6 +17,7 @@
 #include <memory>
 
 #include "arrow/array/builder_binary.h"
+#include "arrow/array/builder_nested.h"
 #include "arrow/scalar.h"
 #include "arrow/type_fwd.h"
 #include "fmt/format.h"
@@ -54,6 +54,8 @@
 #include "milvus-storage/filesystem/fs.h"
 
 namespace milvus::storage {
+
+constexpr const char* TEMP = "tmp";
 
 std::map<std::string, ChunkManagerType> ChunkManagerType_Map = {
     {"local", ChunkManagerType::Local},
@@ -283,6 +285,7 @@ CreateArrowBuilder(DataType data_type) {
             return std::make_shared<arrow::StringBuilder>();
         }
         case DataType::ARRAY:
+        case DataType::VECTOR_ARRAY:
         case DataType::JSON: {
             return std::make_shared<arrow::BinaryBuilder>();
         }
@@ -343,7 +346,11 @@ CreateArrowScalarFromDefaultValue(const FieldMeta& field_meta) {
             return std::make_shared<arrow::BooleanScalar>(
                 default_value.bool_data());
         case DataType::INT8:
+            return std::make_shared<arrow::Int8Scalar>(
+                default_value.int_data());
         case DataType::INT16:
+            return std::make_shared<arrow::Int16Scalar>(
+                default_value.int_data());
         case DataType::INT32:
             return std::make_shared<arrow::Int32Scalar>(
                 default_value.int_data());
@@ -406,6 +413,7 @@ CreateArrowSchema(DataType data_type, bool nullable) {
                 {arrow::field("val", arrow::utf8(), nullable)});
         }
         case DataType::ARRAY:
+        case DataType::VECTOR_ARRAY:
         case DataType::JSON: {
             return arrow::schema(
                 {arrow::field("val", arrow::binary(), nullable)});
@@ -553,28 +561,31 @@ GetDimensionFromArrowArray(std::shared_ptr<arrow::Array> data,
 }
 
 std::string
-GenIndexPathIdentifier(int64_t build_id, int64_t index_version) {
-    return std::to_string(build_id) + "/" + std::to_string(index_version) + "/";
-}
-
-std::string
-GenTextIndexPathIdentifier(int64_t build_id,
-                           int64_t index_version,
-                           int64_t segment_id,
-                           int64_t field_id) {
-    return std::to_string(build_id) + "/" + std::to_string(index_version) +
-           "/" + std::to_string(segment_id) + "/" + std::to_string(field_id) +
+GenIndexPathIdentifier(int64_t build_id,
+                       int64_t index_version,
+                       int64_t segment_id,
+                       int64_t field_id) {
+    return std::to_string(build_id) + "_" + std::to_string(index_version) +
+           "_" + std::to_string(segment_id) + "_" + std::to_string(field_id) +
            "/";
 }
 
 std::string
 GenIndexPathPrefix(ChunkManagerPtr cm,
                    int64_t build_id,
-                   int64_t index_version) {
+                   int64_t index_version,
+                   int64_t segment_id,
+                   int64_t field_id,
+                   bool is_temp) {
     boost::filesystem::path prefix = cm->GetRootPath();
+
+    if (is_temp) {
+        prefix = prefix / TEMP;
+    }
+
     boost::filesystem::path path = std::string(INDEX_ROOT_PATH);
     boost::filesystem::path path1 =
-        GenIndexPathIdentifier(build_id, index_version);
+        GenIndexPathIdentifier(build_id, index_version, segment_id, field_id);
     return (prefix / path / path1).string();
 }
 
@@ -583,11 +594,36 @@ GenTextIndexPathPrefix(ChunkManagerPtr cm,
                        int64_t build_id,
                        int64_t index_version,
                        int64_t segment_id,
-                       int64_t field_id) {
+                       int64_t field_id,
+                       bool is_temp) {
     boost::filesystem::path prefix = cm->GetRootPath();
+
+    if (is_temp) {
+        prefix = prefix / TEMP;
+    }
+
     boost::filesystem::path path = std::string(TEXT_LOG_ROOT_PATH);
-    boost::filesystem::path path1 = GenTextIndexPathIdentifier(
-        build_id, index_version, segment_id, field_id);
+    boost::filesystem::path path1 =
+        GenIndexPathIdentifier(build_id, index_version, segment_id, field_id);
+    return (prefix / path / path1).string();
+}
+
+std::string
+GenJsonKeyIndexPathPrefix(ChunkManagerPtr cm,
+                          int64_t build_id,
+                          int64_t index_version,
+                          int64_t segment_id,
+                          int64_t field_id,
+                          bool is_temp) {
+    boost::filesystem::path prefix = cm->GetRootPath();
+
+    if (is_temp) {
+        prefix = prefix / TEMP;
+    }
+
+    boost::filesystem::path path = std::string(JSON_KEY_INDEX_LOG_ROOT_PATH);
+    boost::filesystem::path path1 =
+        GenIndexPathIdentifier(build_id, index_version, segment_id, field_id);
     return (prefix / path / path1).string();
 }
 
@@ -605,13 +641,13 @@ GenJsonKeyIndexPathIdentifier(int64_t build_id,
 }
 
 std::string
-GenJsonKeyIndexPathPrefix(ChunkManagerPtr cm,
-                          int64_t build_id,
-                          int64_t index_version,
-                          int64_t collection_id,
-                          int64_t partition_id,
-                          int64_t segment_id,
-                          int64_t field_id) {
+GenRemoteJsonKeyIndexPathPrefix(ChunkManagerPtr cm,
+                                int64_t build_id,
+                                int64_t index_version,
+                                int64_t collection_id,
+                                int64_t partition_id,
+                                int64_t segment_id,
+                                int64_t field_id) {
     return cm->GetRootPath() + "/" + std::string(JSON_KEY_INDEX_LOG_ROOT_PATH) +
            "/" +
            GenJsonKeyIndexPathIdentifier(build_id,
@@ -621,15 +657,6 @@ GenJsonKeyIndexPathPrefix(ChunkManagerPtr cm,
                                          segment_id,
                                          field_id);
 }
-
-std::string
-GetIndexPathPrefixWithBuildID(ChunkManagerPtr cm, int64_t build_id) {
-    boost::filesystem::path prefix = cm->GetRootPath();
-    boost::filesystem::path path = std::string(INDEX_ROOT_PATH);
-    boost::filesystem::path path1 = std::to_string(build_id);
-    return (prefix / path / path1).string();
-}
-
 std::string
 GenFieldRawDataPathPrefix(ChunkManagerPtr cm,
                           int64_t segment_id,
@@ -693,8 +720,9 @@ EncodeAndUploadIndexSlice(ChunkManager* chunk_manager,
 
 std::vector<std::future<std::unique_ptr<DataCodec>>>
 GetObjectData(ChunkManager* remote_chunk_manager,
-              const std::vector<std::string>& remote_files) {
-    auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::HIGH);
+              const std::vector<std::string>& remote_files,
+              milvus::ThreadPoolPriority priority) {
+    auto& pool = ThreadPools::GetThreadPool(priority);
     std::vector<std::future<std::unique_ptr<DataCodec>>> futures;
     futures.reserve(remote_files.size());
     for (auto& file : remote_files) {
@@ -933,6 +961,9 @@ CreateFieldData(const DataType& type,
         case DataType::VECTOR_INT8:
             return std::make_shared<FieldData<Int8Vector>>(
                 dim, type, total_num_rows);
+        case DataType::VECTOR_ARRAY:
+            return std::make_shared<FieldData<VectorArray>>(type,
+                                                            total_num_rows);
         default:
             PanicInfo(DataTypeInvalid,
                       "CreateFieldData not support data type " +
@@ -980,7 +1011,7 @@ MergeFieldData(std::vector<FieldDataPtr>& data_array) {
     for (const auto& data : data_array) {
         if (merged_data->IsNullable()) {
             merged_data->FillFieldData(
-                data->Data(), data->ValidData(), data->Length());
+                data->Data(), data->ValidData(), data->Length(), 0);
         } else {
             merged_data->FillFieldData(data->Data(), data->Length());
         }
@@ -1040,88 +1071,74 @@ GetFieldDatasFromStorageV2(std::vector<std::vector<std::string>>& remote_files,
         column_group_files[group_id] = remote_chunk_files;
     }
 
-    for (auto& [column_group_id, remote_chunk_files] : column_group_files) {
-        auto fs = milvus_storage::ArrowFileSystemSingleton::GetInstance()
-                      .GetArrowFileSystem();
-        // read first file to get path and column offset of the field id
-        auto file_reader = std::make_shared<milvus_storage::FileRowGroupReader>(
-            fs, remote_chunk_files[0]);
-        std::shared_ptr<milvus_storage::PackedFileMetadata> metadata =
-            file_reader->file_metadata();
+    std::vector<std::string> remote_chunk_files;
+    if (column_group_files.find(field_id) == column_group_files.end()) {
+        remote_chunk_files = column_group_files[DEFAULT_SHORT_COLUMN_GROUP_ID];
+    } else {
+        remote_chunk_files = column_group_files[field_id];
+    }
 
-        auto field_id_mapping = metadata->GetFieldIDMapping();
+    auto fs = milvus_storage::ArrowFileSystemSingleton::GetInstance()
+                  .GetArrowFileSystem();
 
+    // set up channel for arrow reader
+    auto field_data_info = FieldDataInfo();
+    auto parallel_degree =
+        static_cast<uint64_t>(DEFAULT_FIELD_MAX_MEMORY_LIMIT / FILE_SLICE_SIZE);
+    field_data_info.arrow_reader_channel->set_capacity(parallel_degree);
+
+    auto& pool = ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
+
+    for (auto& column_group_file : remote_chunk_files) {
+        // get all row groups for each file
+        std::vector<std::vector<int64_t>> row_group_lists;
+        auto reader = std::make_shared<milvus_storage::FileRowGroupReader>(
+            fs, column_group_file);
+        auto field_id_mapping = reader->file_metadata()->GetFieldIDMapping();
         auto it = field_id_mapping.find(field_id);
         AssertInfo(it != field_id_mapping.end(),
                    "field id {} not found in field id mapping",
                    field_id);
         auto column_offset = it->second;
-        AssertInfo(column_offset.path_index < remote_files.size(),
-                   "column offset path index {} is out of range",
-                   column_offset.path_index);
-        if (column_offset.path_index != column_group_id) {
-            LOG_INFO("Skip group id {} since target field shall be in group {}",
-                     column_group_id,
-                     column_offset.path_index);
-            continue;
-        }
 
-        // set up channel for arrow reader
-        auto field_data_info = FieldDataInfo();
-        auto parallel_degree = static_cast<uint64_t>(
-            DEFAULT_FIELD_MAX_MEMORY_LIMIT / FILE_SLICE_SIZE);
-        field_data_info.arrow_reader_channel->set_capacity(parallel_degree);
+        auto row_group_num =
+            reader->file_metadata()->GetRowGroupMetadataVector().size();
+        std::vector<int64_t> all_row_groups(row_group_num);
+        std::iota(all_row_groups.begin(), all_row_groups.end(), 0);
+        row_group_lists.push_back(all_row_groups);
 
-        auto& pool =
-            ThreadPools::GetThreadPool(milvus::ThreadPoolPriority::MIDDLE);
+        // create a schema with only the field id
+        auto field_schema =
+            reader->schema()->field(column_offset.col_index)->Copy();
+        auto arrow_schema = arrow::schema({field_schema});
 
-        for (auto& column_group_file : remote_chunk_files) {
-            // get all row groups for each file
-            std::vector<std::vector<int64_t>> row_group_lists;
-            auto reader = std::make_shared<milvus_storage::FileRowGroupReader>(
-                fs, column_group_file);
-            auto row_group_num =
-                reader->file_metadata()->GetRowGroupMetadataVector().size();
-            std::vector<int64_t> all_row_groups(row_group_num);
-            std::iota(all_row_groups.begin(), all_row_groups.end(), 0);
-            row_group_lists.push_back(all_row_groups);
-
-            // create a schema with only the field id
-            auto field_schema =
-                file_reader->schema()->field(column_offset.col_index)->Copy();
-            auto arrow_schema = arrow::schema({field_schema});
-
-            // split row groups for parallel reading
-            auto strategy =
-                std::make_unique<segcore::ParallelDegreeSplitStrategy>(
-                    parallel_degree);
-            auto load_future = pool.Submit([&]() {
-                return LoadWithStrategy(
-                    std::vector<std::string>{column_group_file},
-                    field_data_info.arrow_reader_channel,
-                    DEFAULT_FIELD_MAX_MEMORY_LIMIT,
-                    std::move(strategy),
-                    row_group_lists,
-                    nullptr);
-            });
-            // read field data from channel
-            std::shared_ptr<milvus::ArrowDataWrapper> r;
-            while (field_data_info.arrow_reader_channel->pop(r)) {
-                size_t num_rows = 0;
-                std::vector<std::shared_ptr<arrow::ChunkedArray>>
-                    chunked_arrays;
-                for (const auto& table : r->arrow_tables) {
-                    num_rows += table->num_rows();
-                    chunked_arrays.push_back(
-                        table->column(column_offset.col_index));
-                }
-                auto field_data = storage::CreateFieldData(
-                    data_type, field_schema->nullable(), dim, num_rows);
-                for (const auto& chunked_array : chunked_arrays) {
-                    field_data->FillFieldData(chunked_array);
-                }
-                field_data_list.push_back(field_data);
+        // split row groups for parallel reading
+        auto strategy = std::make_unique<segcore::ParallelDegreeSplitStrategy>(
+            parallel_degree);
+        auto load_future = pool.Submit([&]() {
+            return LoadWithStrategy(std::vector<std::string>{column_group_file},
+                                    field_data_info.arrow_reader_channel,
+                                    DEFAULT_FIELD_MAX_MEMORY_LIMIT,
+                                    std::move(strategy),
+                                    row_group_lists,
+                                    nullptr);
+        });
+        // read field data from channel
+        std::shared_ptr<milvus::ArrowDataWrapper> r;
+        while (field_data_info.arrow_reader_channel->pop(r)) {
+            size_t num_rows = 0;
+            std::vector<std::shared_ptr<arrow::ChunkedArray>> chunked_arrays;
+            for (const auto& table : r->arrow_tables) {
+                num_rows += table->num_rows();
+                chunked_arrays.push_back(
+                    table->column(column_offset.col_index));
             }
+            auto field_data = storage::CreateFieldData(
+                data_type, field_schema->nullable(), dim, num_rows);
+            for (const auto& chunked_array : chunked_arrays) {
+                field_data->FillFieldData(chunked_array);
+            }
+            field_data_list.push_back(field_data);
         }
     }
     return field_data_list;
@@ -1146,7 +1163,7 @@ CacheRawDataAndFillMissing(const MemFileManagerImplPtr& file_manager,
     }
 
     if (lack_binlog_rows > 0) {
-        LOG_INFO("create index lack binlog detected, lock row num: {}",
+        LOG_INFO("create index lack binlog detected, lack row num: {}",
                  lack_binlog_rows);
         auto field_schema = file_manager->GetFieldDataMeta().field_schema;
         auto default_value = [&]() -> std::optional<DefaultValueType> {

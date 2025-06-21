@@ -22,11 +22,28 @@
 
 namespace milvus {
 
+constexpr const char* LOAD_PRIORITY = "load_priority";
+
 enum ThreadPoolPriority {
     HIGH = 0,
     MIDDLE = 1,
     LOW = 2,
 };
+
+inline ThreadPoolPriority
+PriorityForLoad(milvus::proto::common::LoadPriority priority) {
+    return priority == milvus::proto::common::LoadPriority::HIGH
+               ? ThreadPoolPriority::HIGH
+               : ThreadPoolPriority::LOW;
+}
+
+inline milvus::proto::common::LoadPriority
+PriorityForLoad(const std::string& priority_str) {
+    if (priority_str == "LOW") {
+        return milvus::proto::common::LoadPriority::LOW;
+    }
+    return milvus::proto::common::LoadPriority::HIGH;
+}
 
 class ThreadPools {
  public:
@@ -42,15 +59,21 @@ class ThreadPools {
 
  private:
     ThreadPools() {
-        name_map[HIGH] = "high_priority_thread_pool";
-        name_map[MIDDLE] = "middle_priority_thread_pool";
-        name_map[LOW] = "low_priority_thread_pool";
     }
     void
     ShutDown();
+
+    static std::map<ThreadPoolPriority, std::string>
+    name_map() {
+        static std::map<ThreadPoolPriority, std::string> name_map = {
+            {HIGH, "HIGH_SEGC_POOL"},
+            {MIDDLE, "MIDD_SEGC_POOL"},
+            {LOW, "LOW_SEGC_POOL"}};
+        return name_map;
+    }
+
     static std::map<ThreadPoolPriority, std::unique_ptr<ThreadPool>>
         thread_pool_map;
-    static std::map<ThreadPoolPriority, std::string> name_map;
     static std::shared_mutex mutex_;
 };
 
