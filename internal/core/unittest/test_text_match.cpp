@@ -85,7 +85,7 @@ GetMatchExpr(SchemaPtr schema,
     auto expr = test::GenExpr();
     expr->set_allocated_unary_range_expr(unary_range_expr);
 
-    auto parser = ProtoParser(*schema);
+    auto parser = ProtoParser(schema);
     auto typed_expr = parser.ParseExprs(*expr);
     auto parsed =
         std::make_shared<plan::FilterBitsNode>(DEFAULT_PLANNODE_ID, typed_expr);
@@ -155,7 +155,7 @@ TEST(TextMatch, Index) {
                                          "unique_id",
                                          "milvus_tokenizer",
                                          "{}");
-    index->CreateReader();
+    index->CreateReader(milvus::index::SetBitsetSealed);
     index->AddText("football, basketball, pingpang", true, 0);
     index->AddText("", false, 1);
     index->AddText("swimming, football", true, 2);

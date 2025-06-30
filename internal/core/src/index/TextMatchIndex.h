@@ -27,7 +27,7 @@ class TextMatchIndex : public InvertedIndexTantivy<std::string> {
                             const char* unique_id,
                             const char* tokenizer_name,
                             const char* analyzer_params);
-    // for sealed segment.
+    // for sealed segment to create index from raw data during loading.
     explicit TextMatchIndex(const std::string& path,
                             const char* unique_id,
                             uint32_t tantivy_index_version,
@@ -38,7 +38,7 @@ class TextMatchIndex : public InvertedIndexTantivy<std::string> {
                             uint32_t tantivy_index_version,
                             const char* tokenizer_name,
                             const char* analyzer_params);
-    // for loading index
+    // for loading built index
     explicit TextMatchIndex(const storage::FileManagerContext& ctx);
 
  public:
@@ -76,7 +76,7 @@ class TextMatchIndex : public InvertedIndexTantivy<std::string> {
 
  public:
     void
-    CreateReader();
+    CreateReader(SetBitsetFn set_bitset);
 
     void
     RegisterTokenizer(const char* tokenizer_name, const char* analyzer_params);
