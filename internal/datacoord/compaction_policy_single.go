@@ -98,7 +98,7 @@ func (policy *singleCompactionPolicy) triggerOneCollection(ctx context.Context, 
 	views := make([]CompactionView, 0)
 	for _, group := range partSegments {
 		if Params.DataCoordCfg.IndexBasedCompaction.GetAsBool() {
-			group.segments = FilterInIndexedSegments(policy.handler, policy.meta, false, group.segments...)
+			group.segments = FilterInIndexedSegments(ctx, policy.handler, policy.meta, false, group.segments...)
 		}
 
 		collectionTTL, err := getCollectionTTL(collection.Properties)
@@ -108,7 +108,7 @@ func (policy *singleCompactionPolicy) triggerOneCollection(ctx context.Context, 
 		}
 
 		for _, segment := range group.segments {
-			if isDeltalogTooManySegment(segment) || isDeleteRowsTooManySegment(segment) {
+			if hasTooManyDeletions(segment) {
 				segmentViews := GetViewsByInfo(segment)
 				view := &MixSegmentView{
 					label:         segmentViews[0].label,

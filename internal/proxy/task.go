@@ -606,9 +606,9 @@ func (t *dropCollectionTask) OnEnqueue() error {
 }
 
 func (t *dropCollectionTask) PreExecute(ctx context.Context) error {
-	if err := validateCollectionName(t.CollectionName); err != nil {
-		return err
-	}
+	// No need to check collection name
+	// Validation shall be preformed in `CreateCollection`
+	// also permit drop collection one with bad collection name
 	return nil
 }
 
@@ -1885,6 +1885,8 @@ func (t *showPartitionsTask) PostExecute(ctx context.Context) error {
 	return nil
 }
 
+const LoadPriorityName = "load_priority"
+
 type loadCollectionTask struct {
 	baseTask
 	Condition
@@ -1949,6 +1951,15 @@ func (t *loadCollectionTask) PreExecute(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (t *loadCollectionTask) GetLoadPriority() commonpb.LoadPriority {
+	loadPriority := commonpb.LoadPriority_HIGH
+	loadPriorityStr, ok := t.LoadCollectionRequest.LoadParams[LoadPriorityName]
+	if ok && loadPriorityStr == "low" {
+		loadPriority = commonpb.LoadPriority_LOW
+	}
+	return loadPriority
 }
 
 func (t *loadCollectionTask) Execute(ctx context.Context) (err error) {
@@ -2023,9 +2034,11 @@ func (t *loadCollectionTask) Execute(ctx context.Context) (err error) {
 		Refresh:        t.Refresh,
 		ResourceGroups: t.ResourceGroups,
 		LoadFields:     loadFields,
+		Priority:       t.GetLoadPriority(),
 	}
-	log.Debug("send LoadCollectionRequest to query coordinator",
-		zap.Any("schema", request.Schema))
+	log.Info("send LoadCollectionRequest to query coordinator",
+		zap.Any("schema", request.Schema),
+		zap.Int32("priority", int32(request.GetPriority())))
 	t.result, err = t.mixCoord.LoadCollection(ctx, request)
 	if err = merr.CheckRPCCall(t.result, err); err != nil {
 		return fmt.Errorf("call query coordinator LoadCollection: %s", err)
@@ -2207,6 +2220,15 @@ func (t *loadPartitionsTask) PreExecute(ctx context.Context) error {
 	return nil
 }
 
+func (t *loadPartitionsTask) GetLoadPriority() commonpb.LoadPriority {
+	loadPriority := commonpb.LoadPriority_HIGH
+	loadPriorityStr, ok := t.LoadPartitionsRequest.LoadParams[LoadPriorityName]
+	if ok && loadPriorityStr == "low" {
+		loadPriority = commonpb.LoadPriority_LOW
+	}
+	return loadPriority
+}
+
 func (t *loadPartitionsTask) Execute(ctx context.Context) error {
 	var partitionIDs []int64
 	collID, err := globalMetaCache.GetCollectionID(ctx, t.GetDbName(), t.CollectionName)
@@ -2284,7 +2306,11 @@ func (t *loadPartitionsTask) Execute(ctx context.Context) error {
 		Refresh:        t.Refresh,
 		ResourceGroups: t.ResourceGroups,
 		LoadFields:     loadFields,
+		Priority:       t.GetLoadPriority(),
 	}
+	log.Info("send LoadPartitionRequest to query coordinator",
+		zap.Any("schema", request.Schema),
+		zap.Int32("priority", int32(request.GetPriority())))
 	t.result, err = t.mixCoord.LoadPartitions(ctx, request)
 	if err = merr.CheckRPCCall(t.result, err); err != nil {
 		return err
@@ -2980,20 +3006,16 @@ func (t *RunAnalyzerTask) OnEnqueue() error {
 }
 
 func (t *RunAnalyzerTask) PreExecute(ctx context.Context) error {
-	dbName := t.GetDbName()
-	if dbName == "" {
-		dbName = "default"
-	}
-	t.dbName = dbName
+	t.dbName = t.GetDbName()
 
-	collID, err := globalMetaCache.GetCollectionID(ctx, dbName, t.GetCollectionName())
+	collID, err := globalMetaCache.GetCollectionID(ctx, t.dbName, t.GetCollectionName())
 	if err != nil { // err is not nil if collection not exists
 		return merr.WrapErrAsInputErrorWhen(err, merr.ErrCollectionNotFound, merr.ErrDatabaseNotFound)
 	}
 
 	t.collectionID = collID
 
-	schema, err := globalMetaCache.GetCollectionSchema(ctx, dbName, t.GetCollectionName())
+	schema, err := globalMetaCache.GetCollectionSchema(ctx, t.dbName, t.GetCollectionName())
 	if err != nil { // err is not nil if collection not exists
 		return merr.WrapErrAsInputErrorWhen(err, merr.ErrCollectionNotFound, merr.ErrDatabaseNotFound)
 	}

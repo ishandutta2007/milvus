@@ -19,6 +19,7 @@ package task
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -34,6 +35,7 @@ import (
 	. "github.com/milvus-io/milvus/internal/querycoordv2/params"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
+	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
@@ -54,6 +56,7 @@ var segmentsVersion = semver.Version{
 }
 
 type Executor struct {
+	nodeID    int64
 	doneCh    chan struct{}
 	wg        sync.WaitGroup
 	meta      *meta.Meta
@@ -96,6 +99,17 @@ func (ex *Executor) Stop() {
 	ex.wg.Wait()
 }
 
+func (ex *Executor) GetTaskExecutionCap() int32 {
+	nodeInfo := ex.nodeMgr.Get(ex.nodeID)
+	if nodeInfo == nil || nodeInfo.CPUNum() == 0 {
+		return Params.QueryCoordCfg.TaskExecutionCap.GetAsInt32()
+	}
+
+	ret := int32(math.Ceil(float64(nodeInfo.CPUNum()) * Params.QueryCoordCfg.QueryNodeTaskParallelismFactor.GetAsFloat()))
+
+	return ret
+}
+
 // Execute executes the given action,
 // does nothing and returns false if the action is already committed,
 // returns true otherwise.
@@ -104,7 +118,7 @@ func (ex *Executor) Execute(task Task, step int) bool {
 	if exist {
 		return false
 	}
-	if ex.executingTaskNum.Inc() > Params.QueryCoordCfg.TaskExecutionCap.GetAsInt32() {
+	if ex.executingTaskNum.Inc() > ex.GetTaskExecutionCap() {
 		ex.executingTasks.Remove(task.Index())
 		ex.executingTaskNum.Dec()
 		return false
@@ -194,11 +208,10 @@ func (ex *Executor) loadSegment(task *SegmentTask, step int) error {
 		return err
 	}
 
-	loadInfo, indexInfos, err := ex.getLoadInfo(ctx, task.CollectionID(), action.SegmentID, channel)
+	loadInfo, indexInfos, err := ex.getLoadInfo(ctx, task.CollectionID(), action.SegmentID, channel, task.LoadPriority())
 	if err != nil {
 		return err
 	}
-
 	req := packLoadSegmentRequest(
 		task,
 		action,
@@ -225,6 +238,11 @@ func (ex *Executor) loadSegment(task *SegmentTask, step int) error {
 		return err
 	}
 	log = log.With(zap.Int64("shardLeader", view.Node))
+
+	// NOTE: for balance segment task, expected load and release execution on the same shard leader
+	if GetTaskType(task) == TaskTypeMove {
+		task.SetShardLeaderID(view.Node)
+	}
 
 	startTs := time.Now()
 	log.Info("load segments...")
@@ -257,6 +275,12 @@ func (ex *Executor) releaseSegment(task *SegmentTask, step int) {
 	)
 
 	ctx := task.Context()
+	var err error
+	defer func() {
+		if err != nil {
+			task.Fail(err)
+		}
+	}()
 
 	dstNode := action.Node()
 
@@ -287,7 +311,14 @@ func (ex *Executor) releaseSegment(task *SegmentTask, step int) {
 				view := ex.dist.ChannelDistManager.GetShardLeader(task.Shard(), replica)
 				if view == nil {
 					msg := "no shard leader for the segment to execute releasing"
-					err := merr.WrapErrChannelNotFound(task.Shard(), "shard delegator not found")
+					err = merr.WrapErrChannelNotFound(task.Shard(), "shard delegator not found")
+					log.Warn(msg, zap.Error(err))
+					return
+				}
+				// NOTE: for balance segment task, expected load and release execution on the same shard leader
+				if GetTaskType(task) == TaskTypeMove && task.ShardLeaderID() != view.Node {
+					msg := "shard leader changed, skip release"
+					err = merr.WrapErrServiceInternal(fmt.Sprintf("shard leader changed from %d to %d", task.ShardLeaderID(), view.Node))
 					log.Warn(msg, zap.Error(err))
 					return
 				}
@@ -364,8 +395,7 @@ func (ex *Executor) subscribeChannel(task *ChannelTask, step int) error {
 	}
 	loadMeta := packLoadMeta(
 		ex.meta.GetLoadType(ctx, task.CollectionID()),
-		task.CollectionID(),
-		collectionInfo.GetDbName(),
+		collectionInfo,
 		task.ResourceGroup(),
 		loadFields,
 		partitions...,
@@ -390,6 +420,7 @@ func (ex *Executor) subscribeChannel(task *ChannelTask, step int) error {
 		task,
 		action,
 		collectionInfo.GetSchema(),
+		collectionInfo.GetProperties(),
 		loadMeta,
 		dmChannel,
 		indexInfo,
@@ -573,7 +604,7 @@ func (ex *Executor) setDistribution(task *LeaderTask, step int) error {
 		return err
 	}
 
-	loadInfo, indexInfo, err := ex.getLoadInfo(ctx, task.CollectionID(), action.SegmentID(), channel)
+	loadInfo, indexInfo, err := ex.getLoadInfo(ctx, task.CollectionID(), action.SegmentID(), channel, commonpb.LoadPriority_LOW)
 	if err != nil {
 		return err
 	}
@@ -688,8 +719,7 @@ func (ex *Executor) getMetaInfo(ctx context.Context, task Task) (*milvuspb.Descr
 
 	loadMeta := packLoadMeta(
 		ex.meta.GetLoadType(ctx, task.CollectionID()),
-		task.CollectionID(),
-		collectionInfo.GetDbName(),
+		collectionInfo,
 		task.ResourceGroup(),
 		loadFields,
 		partitions...,
@@ -704,7 +734,7 @@ func (ex *Executor) getMetaInfo(ctx context.Context, task Task) (*milvuspb.Descr
 	return collectionInfo, loadMeta, channel, nil
 }
 
-func (ex *Executor) getLoadInfo(ctx context.Context, collectionID, segmentID int64, channel *meta.DmChannel) (*querypb.SegmentLoadInfo, []*indexpb.IndexInfo, error) {
+func (ex *Executor) getLoadInfo(ctx context.Context, collectionID, segmentID int64, channel *meta.DmChannel, priority commonpb.LoadPriority) (*querypb.SegmentLoadInfo, []*indexpb.IndexInfo, error) {
 	log := log.Ctx(ctx)
 	segmentInfos, err := ex.broker.GetSegmentInfo(ctx, segmentID)
 	if err != nil || len(segmentInfos) == 0 {
@@ -745,8 +775,11 @@ func (ex *Executor) getLoadInfo(ctx context.Context, collectionID, segmentID int
 			}
 		}
 		segmentIndex.IndexParams = funcutil.Map2KeyValuePair(params)
+		segmentIndex.IndexParams = append(segmentIndex.IndexParams,
+			&commonpb.KeyValuePair{Key: common.LoadPriorityKey, Value: priority.String()})
 	}
 
 	loadInfo := utils.PackSegmentLoadInfo(segment, channel.GetSeekPosition(), indexes[segment.GetID()])
+	loadInfo.Priority = priority
 	return loadInfo, indexInfos, nil
 }

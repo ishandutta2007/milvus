@@ -53,6 +53,7 @@ DefaultValueChunkTranslator::cell_id_of(milvus::cachinglayer::uid_t uid) const {
 milvus::cachinglayer::ResourceUsage
 DefaultValueChunkTranslator::estimated_byte_size_of_cell(
     milvus::cachinglayer::cid_t cid) const {
+    // TODO(tiered storage 1): provide a better estimation.
     return milvus::cachinglayer::ResourceUsage{0, 0};
 }
 
@@ -84,13 +85,7 @@ DefaultValueChunkTranslator::get_cells(
                ast.ToString());
     arrow::ArrayVector array_vec;
     array_vec.emplace_back(builder->Finish().ValueOrDie());
-    auto chunk = create_chunk(
-        field_meta_,
-        IsVectorDataType(field_meta_.get_data_type()) &&
-                !IsSparseFloatVectorDataType(field_meta_.get_data_type())
-            ? field_meta_.get_dim()
-            : 1,
-        array_vec);
+    auto chunk = create_chunk(field_meta_, array_vec);
 
     std::vector<
         std::pair<milvus::cachinglayer::cid_t, std::unique_ptr<milvus::Chunk>>>
