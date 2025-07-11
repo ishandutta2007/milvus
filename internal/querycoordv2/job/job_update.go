@@ -22,6 +22,7 @@ import (
 	"github.com/samber/lo"
 	"go.uber.org/zap"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/observers"
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
@@ -32,13 +33,14 @@ import (
 
 type UpdateLoadConfigJob struct {
 	*BaseJob
-	collectionID       int64
-	newReplicaNumber   int32
-	newResourceGroups  []string
-	meta               *meta.Meta
-	targetMgr          meta.TargetManagerInterface
-	targetObserver     *observers.TargetObserver
-	collectionObserver *observers.CollectionObserver
+	collectionID             int64
+	newReplicaNumber         int32
+	newResourceGroups        []string
+	meta                     *meta.Meta
+	targetMgr                meta.TargetManagerInterface
+	targetObserver           *observers.TargetObserver
+	collectionObserver       *observers.CollectionObserver
+	userSpecifiedReplicaMode bool
 }
 
 func NewUpdateLoadConfigJob(ctx context.Context,
@@ -47,17 +49,19 @@ func NewUpdateLoadConfigJob(ctx context.Context,
 	targetMgr meta.TargetManagerInterface,
 	targetObserver *observers.TargetObserver,
 	collectionObserver *observers.CollectionObserver,
+	userSpecifiedReplicaMode bool,
 ) *UpdateLoadConfigJob {
 	collectionID := req.GetCollectionIDs()[0]
 	return &UpdateLoadConfigJob{
-		BaseJob:            NewBaseJob(ctx, req.Base.GetMsgID(), collectionID),
-		meta:               meta,
-		targetMgr:          targetMgr,
-		targetObserver:     targetObserver,
-		collectionObserver: collectionObserver,
-		collectionID:       collectionID,
-		newReplicaNumber:   req.GetReplicaNumber(),
-		newResourceGroups:  req.GetResourceGroups(),
+		BaseJob:                  NewBaseJob(ctx, req.Base.GetMsgID(), collectionID),
+		meta:                     meta,
+		targetMgr:                targetMgr,
+		targetObserver:           targetObserver,
+		collectionObserver:       collectionObserver,
+		collectionID:             collectionID,
+		newReplicaNumber:         req.GetReplicaNumber(),
+		newResourceGroups:        req.GetResourceGroups(),
+		userSpecifiedReplicaMode: userSpecifiedReplicaMode,
 	}
 }
 
@@ -99,7 +103,7 @@ func (job *UpdateLoadConfigJob) Execute() error {
 
 	// 3. try to spawn new replica
 	channels := job.targetMgr.GetDmChannelsByCollection(job.ctx, job.collectionID, meta.CurrentTargetFirst)
-	newReplicas, spawnErr := job.meta.ReplicaManager.Spawn(job.ctx, job.collectionID, toSpawn, lo.Keys(channels))
+	newReplicas, spawnErr := job.meta.ReplicaManager.Spawn(job.ctx, job.collectionID, toSpawn, lo.Keys(channels), commonpb.LoadPriority_LOW)
 	if spawnErr != nil {
 		log.Warn("failed to spawn replica", zap.Error(spawnErr))
 		err := spawnErr
@@ -158,7 +162,7 @@ func (job *UpdateLoadConfigJob) Execute() error {
 	utils.RecoverReplicaOfCollection(job.ctx, job.meta, job.collectionID)
 
 	// 7. update replica number in meta
-	err = job.meta.UpdateReplicaNumber(job.ctx, job.collectionID, job.newReplicaNumber)
+	err = job.meta.UpdateReplicaNumber(job.ctx, job.collectionID, job.newReplicaNumber, job.userSpecifiedReplicaMode)
 	if err != nil {
 		msg := "failed to update replica number"
 		log.Warn(msg, zap.Error(err))

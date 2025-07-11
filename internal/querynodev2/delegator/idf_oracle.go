@@ -404,7 +404,7 @@ func (o *idfOracle) syncloop() {
 
 func (o *idfOracle) localloop() {
 	pool := conc.NewPool[struct{}](paramtable.Get().QueryNodeCfg.IDFWriteConcurrenct.GetAsInt())
-	o.dirPath = path.Join(paramtable.Get().QueryNodeCfg.IDFLocalPath.GetValue(), fmt.Sprintf("%d", o.collectionID))
+	o.dirPath = path.Join(paramtable.Get().LocalStorageCfg.Path.GetValue(), "bm25", fmt.Sprintf("%d", o.collectionID))
 
 	defer o.wg.Done()
 	for {
@@ -463,6 +463,9 @@ func (o *idfOracle) SyncDistribution() error {
 
 			if segment.TargetVersion == snapshot.targetVersion {
 				sealedMap[segment.SegmentID] = true
+				if !o.sealed.Contain(segment.SegmentID) {
+					log.Warn("idf oracle lack some sealed segment", zap.Int64("segment", segment.SegmentID))
+				}
 			} else if segment.TargetVersion == unreadableTargetVersion {
 				sealedMap[segment.SegmentID] = false
 			}

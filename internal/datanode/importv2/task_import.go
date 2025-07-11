@@ -18,6 +18,7 @@ package importv2
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"time"
 
@@ -35,8 +36,6 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/conc"
-	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -104,14 +103,11 @@ func (t *ImportTask) GetSchema() *schemapb.CollectionSchema {
 }
 
 func (t *ImportTask) GetSlots() int64 {
-	// Consider the following two scenarios:
-	// 1. Importing a large number of small files results in
-	//    a small total data size, making file count unsuitable as a slot number.
-	// 2. Importing a file with many shards number results in many segments and a small total data size,
-	//    making segment count unsuitable as a slot number.
-	// Taking these factors into account, we've decided to use the
-	// minimum value between segment count and file count as the slot number.
-	return int64(funcutil.Min(len(t.GetFileStats()), len(t.GetSegmentIDs()), paramtable.Get().DataNodeCfg.MaxTaskSlotNum.GetAsInt()))
+	return t.req.GetTaskSlot()
+}
+
+func (t *ImportTask) GetBufferSize() int64 {
+	return GetTaskBufferSize(t)
 }
 
 func (t *ImportTask) Cancel() {
@@ -139,19 +135,21 @@ func (t *ImportTask) Clone() Task {
 }
 
 func (t *ImportTask) Execute() []*conc.Future[any] {
-	bufferSize := paramtable.Get().DataNodeCfg.ReadBufferSizeInMB.GetAsInt() * 1024 * 1024
+	bufferSize := int(t.GetBufferSize())
 	log.Info("start to import", WrapLogFields(t,
 		zap.Int("bufferSize", bufferSize),
+		zap.Int64("taskSlot", t.GetSlots()),
 		zap.Any("schema", t.GetSchema()))...)
 	t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_InProgress))
 
 	req := t.req
 
 	fn := func(file *internalpb.ImportFile) error {
-		reader, err := importutilv2.NewReader(t.ctx, t.cm, t.GetSchema(), file, req.GetOptions(), bufferSize)
+		reader, err := importutilv2.NewReader(t.ctx, t.cm, t.GetSchema(), file, req.GetOptions(), bufferSize, t.req.GetStorageConfig())
 		if err != nil {
 			log.Warn("new reader failed", WrapLogFields(t, zap.String("file", file.String()), zap.Error(err))...)
-			t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(err.Error()))
+			reason := fmt.Sprintf("error: %v, file: %s", err, file.String())
+			t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(reason))
 			return err
 		}
 		defer reader.Close()
@@ -159,7 +157,8 @@ func (t *ImportTask) Execute() []*conc.Future[any] {
 		err = t.importFile(reader)
 		if err != nil {
 			log.Warn("do import failed", WrapLogFields(t, zap.String("file", file.String()), zap.Error(err))...)
-			t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(err.Error()))
+			reason := fmt.Sprintf("error: %v, file: %s", err, file.String())
+			t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(reason))
 			return err
 		}
 		log.Info("import file done", WrapLogFields(t, zap.Strings("files", file.GetPaths()),
@@ -200,6 +199,10 @@ func (t *ImportTask) importFile(reader importutilv2.Reader) error {
 			return err
 		}
 		err = AppendNullableDefaultFieldsData(t.GetSchema(), data, rowNum)
+		if err != nil {
+			return err
+		}
+		err = FillDynamicData(t.GetSchema(), data, rowNum)
 		if err != nil {
 			return err
 		}
@@ -260,11 +263,12 @@ func (t *ImportTask) sync(hashedData HashedData) ([]*conc.Future[struct{}], []sy
 				}
 			}
 			syncTask, err := NewSyncTask(t.ctx, t.allocator, t.metaCaches, t.req.GetTs(),
-				segmentID, partitionID, t.GetCollectionID(), channel, data, nil, bm25Stats)
+				segmentID, partitionID, t.GetCollectionID(), channel, data, nil,
+				bm25Stats, t.req.GetStorageVersion(), t.req.GetStorageConfig())
 			if err != nil {
 				return nil, nil, err
 			}
-			future, err := t.syncMgr.SyncData(t.ctx, syncTask)
+			future, err := t.syncMgr.SyncDataWithChunkManager(t.ctx, syncTask, t.cm)
 			if err != nil {
 				log.Ctx(context.TODO()).Error("sync data failed", WrapLogFields(t, zap.Error(err))...)
 				return nil, nil, err

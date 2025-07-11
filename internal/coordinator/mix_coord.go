@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tidwall/gjson"
 	"github.com/tikv/client-go/v2/txnkv"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/atomic"
@@ -165,6 +166,11 @@ func (s *mixCoordImpl) initInternal() error {
 	s.datacoordServer.SetMixCoord(s)
 	s.queryCoordServer.SetMixCoord(s)
 
+	if err := s.streamingCoord.Start(s.ctx); err != nil {
+		log.Error("streamCoord start failed", zap.Error(err))
+		return err
+	}
+
 	if err := s.rootcoordServer.Init(); err != nil {
 		log.Error("rootCoord init failed", zap.Error(err))
 		return err
@@ -172,11 +178,6 @@ func (s *mixCoordImpl) initInternal() error {
 
 	if err := s.rootcoordServer.Start(); err != nil {
 		log.Error("rootCoord start failed", zap.Error(err))
-		return err
-	}
-
-	if err := s.streamingCoord.Start(s.ctx); err != nil {
-		log.Error("streamCoord start failed", zap.Error(err))
 		return err
 	}
 
@@ -580,6 +581,15 @@ func (s *mixCoordImpl) GetStatisticsChannel(ctx context.Context, req *internalpb
 func (s *mixCoordImpl) GetMetrics(ctx context.Context, in *milvuspb.GetMetricsRequest) (*milvuspb.GetMetricsResponse, error) {
 	systemTopology := metricsinfo.SystemTopology{
 		NodesInfo: make([]metricsinfo.SystemTopologyNode, 0),
+	}
+
+	// If a processing role is specified, the corresponding role will be used for processing
+	ret := gjson.Parse(in.GetRequest())
+	processRole, _ := metricsinfo.ParseMetricProcessInRole(ret)
+	if len(processRole) > 0 && processRole == typeutil.QueryCoordRole {
+		return s.GetQcMetrics(ctx, in)
+	} else if len(processRole) > 0 && processRole == typeutil.DataCoordRole {
+		return s.GetDcMetrics(ctx, in)
 	}
 
 	identifierMap := make(map[string]int)
@@ -1062,4 +1072,8 @@ func (s *mixCoordImpl) RegisterStreamingCoordGRPCService(server *grpc.Server) {
 
 func (s *mixCoordImpl) GetQuotaMetrics(ctx context.Context, req *internalpb.GetQuotaMetricsRequest) (*internalpb.GetQuotaMetricsResponse, error) {
 	return s.rootcoordServer.GetQuotaMetrics(ctx, req)
+}
+
+func (s *mixCoordImpl) ListLoadedSegments(ctx context.Context, req *querypb.ListLoadedSegmentsRequest) (*querypb.ListLoadedSegmentsResponse, error) {
+	return s.queryCoordServer.ListLoadedSegments(ctx, req)
 }

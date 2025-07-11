@@ -13,7 +13,9 @@
 
 #include <atomic>
 #include <memory>
+#include <shared_mutex>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 #include <index/ScalarIndex.h>
@@ -30,6 +32,8 @@
 #include "common/QueryResult.h"
 #include "common/QueryInfo.h"
 #include "mmap/ChunkedColumnInterface.h"
+#include "index/Index.h"
+#include "index/JsonFlatIndex.h"
 #include "query/Plan.h"
 #include "pb/segcore.pb.h"
 #include "index/SkipIndex.h"
@@ -37,6 +41,7 @@
 #include "index/JsonKeyStatsInvertedIndex.h"
 #include "segcore/ConcurrentVector.h"
 #include "segcore/InsertRecord.h"
+#include "index/NgramInvertedIndex.h"
 
 namespace milvus::segcore {
 
@@ -134,18 +139,24 @@ class SegmentInterface {
     virtual index::TextMatchIndex*
     GetTextIndex(FieldId field_id) const = 0;
 
-    virtual index::IndexBase*
+    virtual PinWrapper<index::IndexBase*>
     GetJsonIndex(FieldId field_id, std::string path) const {
         return nullptr;
     }
     virtual index::JsonKeyStatsInvertedIndex*
     GetJsonKeyIndex(FieldId field_id) const = 0;
 
-    virtual std::pair<milvus::Json, bool>
-    GetJsonData(FieldId field_id, size_t offset) const = 0;
+    virtual void
+    BulkGetJsonData(FieldId field_id,
+                    std::function<void(milvus::Json, size_t, bool)> fn,
+                    const int64_t* offsets,
+                    int64_t count) const = 0;
+
+    virtual PinWrapper<index::NgramInvertedIndex*>
+    GetNgramIndex(FieldId field_id) const = 0;
 
     virtual void
-    LazyCheckSchema(const Schema& sch) = 0;
+    LazyCheckSchema(SchemaPtr sch) = 0;
 
     // reopen segment with new schema
     virtual void
@@ -186,7 +197,7 @@ class SegmentInternalInterface : public SegmentInterface {
             std::vector<Json> res;
             res.reserve(string_views.size());
             for (const auto& str_view : string_views) {
-                res.emplace_back(str_view);
+                res.emplace_back(Json(str_view));
             }
             return PinWrapper<
                 std::pair<std::vector<ViewType>, FixedVector<bool>>>(
@@ -245,6 +256,17 @@ class SegmentInternalInterface : public SegmentInterface {
         return PinWrapper<const index::ScalarIndex<T>*>(pw, ptr);
     }
 
+    // We should not expose this interface directly, but access the index through chunk_scalar_index.
+    // However, chunk_scalar_index requires specifying a template parameter, which makes it impossible to return JsonFlatIndex.
+    // A better approach would be to have chunk_scalar_index return a pointer to a base class,
+    // and then use dynamic_cast to convert it. But this would cause a lot of code changes, so for now, we will do it this way.
+    PinWrapper<const index::IndexBase*>
+    chunk_json_index(FieldId field_id,
+                     std::string& json_path,
+                     int64_t chunk_id) const {
+        return chunk_index_impl(field_id, json_path, chunk_id);
+    }
+
     // union(segment_id, field_id) as unique id
     virtual std::string
     GetUniqueFieldId(int64_t field_id) const {
@@ -301,7 +323,8 @@ class SegmentInternalInterface : public SegmentInterface {
     HasIndex(FieldId field_id,
              const std::string& nested_path,
              DataType data_type,
-             bool any_type = false) const = 0;
+             bool any_type = false,
+             bool is_array = false) const = 0;
 
     virtual bool
     HasFieldData(FieldId field_id) const = 0;
@@ -342,6 +365,9 @@ class SegmentInternalInterface : public SegmentInterface {
 
     virtual index::JsonKeyStatsInvertedIndex*
     GetJsonKeyIndex(FieldId field_id) const override;
+
+    virtual PinWrapper<index::NgramInvertedIndex*>
+    GetNgramIndex(FieldId field_id) const override;
 
  public:
     virtual void
@@ -490,7 +516,7 @@ class SegmentInternalInterface : public SegmentInterface {
  public:
     virtual PinWrapper<const index::IndexBase*>
     chunk_index_impl(FieldId field_id,
-                     std::string path,
+                     const std::string& path,
                      int64_t chunk_id) const {
         PanicInfo(ErrorCode::NotImplemented, "not implemented");
     };
@@ -521,6 +547,9 @@ class SegmentInternalInterface : public SegmentInterface {
     search_pk(const PkType& pk, Timestamp timestamp) const = 0;
 
  protected:
+    // mutex protecting rw options on schema_
+    std::shared_mutex sch_mutex_;
+
     mutable std::shared_mutex mutex_;
     // fieldID -> std::pair<num_rows, avg_size>
     std::unordered_map<FieldId, std::pair<int64_t, int64_t>>

@@ -88,7 +88,7 @@ class TestMilvusClientCollectionInvalid(TestMilvusClientV2Base):
         client = self._client()
         # 1. create collection
         collection_name = "  "
-        error = {ct.err_code: 0, ct.err_msg: "collection name should not be empty: invalid parameter"}
+        error = {ct.err_code: 1100, ct.err_msg: "Invalid collection name"}
         self.create_collection(client, collection_name, default_dim,
                                check_task=CheckTasks.err_res, check_items=error)
 
@@ -199,6 +199,25 @@ class TestMilvusClientCollectionInvalid(TestMilvusClientV2Base):
         self.create_collection(client, collection_name, schema=schema,
                                check_task=CheckTasks.err_res, check_items=error)
 
+    @pytest.mark.tags(CaseLabel.L2)
+    def test_milvus_client_collection_add_field_as_primary(self):
+        """
+        target: test fast create collection with add new field as primary
+        method: create collection name with add new field as primary
+        expected: raise exception
+        """
+        client = self._client()
+        collection_name = cf.gen_collection_name_by_testcase_name()
+        # 1. create collection
+        dim, field_name = 8, "field_new"
+        error = {ct.err_code: 1100, ct.err_msg: f"not support to add pk field, "
+                                                f"field name = {field_name}: invalid parameter"}
+        self.create_collection(client, collection_name, dim)
+        collections = self.list_collections(client)[0]
+        assert collection_name in collections
+        self.add_collection_field(client, collection_name, field_name=field_name, data_type=DataType.INT64,
+                                  nullable=True, is_primary=True, check_task=CheckTasks.err_res, check_items=error)
+
 
 class TestMilvusClientCollectionValid(TestMilvusClientV2Base):
     """ Test case of create collection interface """
@@ -279,7 +298,8 @@ class TestMilvusClientCollectionValid(TestMilvusClientV2Base):
     @pytest.mark.tags(CaseLabel.L0)
     @pytest.mark.parametrize("nullable", [True, False])
     @pytest.mark.parametrize("vector_type", [DataType.FLOAT_VECTOR, DataType.INT8_VECTOR])
-    def test_milvus_client_collection_self_creation_default(self, nullable, vector_type):
+    @pytest.mark.parametrize("add_field", [True, False])
+    def test_milvus_client_collection_self_creation_default(self, nullable, vector_type, add_field):
         """
         target: test self create collection normal case
         method: create collection
@@ -311,6 +331,12 @@ class TestMilvusClientCollectionValid(TestMilvusClientV2Base):
                        "vector_name": "embeddings"}
         if nullable:
             check_items["nullable_fields"] = ["nullable_field", "array_field"]
+        if add_field:
+            self.add_collection_field(client, collection_name, field_name="field_new_int64", data_type=DataType.INT64,
+                                      nullable=True, is_cluster_key=True)
+            self.add_collection_field(client, collection_name, field_name="field_new_var", data_type=DataType.VARCHAR,
+                                      nullable=True, default_vaule="field_new_var", max_length=64)
+            check_items["add_fields"] = ["field_new_int64", "field_new_var"]
         self.describe_collection(client, collection_name,
                                  check_task=CheckTasks.check_describe_collection_property,
                                  check_items=check_items)
@@ -668,6 +694,7 @@ class TestMilvusClientDropCollectionInvalid(TestMilvusClientV2Base):
 
     @pytest.mark.tags(CaseLabel.L1)
     @pytest.mark.parametrize("name", ["12-s", "12 s", "(mn)", "中文", "%$#"])
+    @pytest.mark.skip(reason="https://github.com/milvus-io/milvus/pull/43064 change drop alias restraint")
     def test_milvus_client_drop_collection_invalid_collection_name(self, name):
         """
         target: test fast create collection normal case
@@ -1208,7 +1235,7 @@ class TestMilvusClientCollectionPropertiesInvalid(TestMilvusClientV2Base):
         self.alter_collection_properties(client, alter_name, properties,
                                      check_task=CheckTasks.err_res,
                                      check_items=error)
-        
+
     @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("properties", [""])
     def test_milvus_client_alter_collection_properties_invalid_properties(self, properties):
@@ -1250,7 +1277,7 @@ class TestMilvusClientCollectionPropertiesInvalid(TestMilvusClientV2Base):
         self.drop_collection_properties(client, drop_name, properties,
                                         check_task=CheckTasks.err_res,
                                         check_items=error)
-        
+
     @pytest.mark.tags(CaseLabel.L2)
     @pytest.mark.parametrize("property_keys", ["", {}, []])
     def test_milvus_client_drop_collection_properties_invalid_properties(self, property_keys):

@@ -259,7 +259,12 @@ func (loader *segmentLoader) Load(ctx context.Context,
 		addBucketNameStorageV2(segmentInfo)
 	}
 
-	coll := loader.manager.Collection.Get(collectionID)
+	collection := loader.manager.Collection.Get(collectionID)
+	if collection == nil {
+		err := merr.WrapErrCollectionNotFound(collectionID)
+		log.Warn("failed to get collection", zap.Error(err))
+		return nil, err
+	}
 
 	// Filter out loaded & loading segments
 	infos := loader.prepare(ctx, segmentType, segments...)
@@ -276,7 +281,7 @@ func (loader *segmentLoader) Load(ctx context.Context,
 	var err error
 	var requestResourceResult requestResourceResult
 
-	if !isLazyLoad(coll, segmentType) {
+	if !isLazyLoad(collection, segmentType) {
 		// Check memory & storage limit
 		// no need to check resource for lazy load here
 		requestResourceResult, err = loader.requestResource(ctx, infos...)
@@ -299,13 +304,6 @@ func (loader *segmentLoader) Load(ctx context.Context,
 		})
 		debug.FreeOSMemory()
 	}()
-
-	collection := loader.manager.Collection.Get(collectionID)
-	if collection == nil {
-		err := merr.WrapErrCollectionNotFound(collectionID)
-		log.Warn("failed to get collection", zap.Error(err))
-		return nil, err
-	}
 
 	for _, info := range infos {
 		loadInfo := info
@@ -798,7 +796,7 @@ func (loader *segmentLoader) loadSealedSegment(ctx context.Context, loadInfo *qu
 	log := log.Ctx(ctx).With(zap.Int64("segmentID", segment.ID()))
 	tr := timerecord.NewTimeRecorder("segmentLoader.loadSealedSegment")
 	log.Info("Start loading fields...",
-		// zap.Int64s("indexedFields", lo.Keys(indexedFieldInfos)),
+		zap.Int("indexedFields count", len(indexedFieldInfos)),
 		zap.Int64s("indexed text fields", lo.Keys(textIndexes)),
 		zap.Int64s("unindexed text fields", lo.Keys(unindexedTextFields)),
 		zap.Int64s("indexed json key fields", lo.Keys(jsonKeyStats)),
@@ -891,7 +889,8 @@ func (loader *segmentLoader) LoadSegment(ctx context.Context,
 
 	log.Info("start loading segment files",
 		zap.Int64("rowNum", loadInfo.GetNumOfRows()),
-		zap.String("segmentType", segment.Type().String()))
+		zap.String("segmentType", segment.Type().String()),
+		zap.Int32("priority", int32(loadInfo.GetPriority())))
 
 	collection := loader.manager.Collection.Get(segment.Collection())
 	if collection == nil {
@@ -1499,36 +1498,29 @@ func getResourceUsageEstimateOfSegment(schema *schemapb.CollectionSchema, loadIn
 	var mmapFieldCount int
 	var fieldGpuMemorySize []uint64
 
-	fieldID2IndexInfo := make(map[int64]*querypb.FieldIndexInfo)
-	for _, fieldIndexInfo := range loadInfo.IndexInfos {
-		fieldID := fieldIndexInfo.FieldID
-		fieldID2IndexInfo[fieldID] = fieldIndexInfo
-	}
+	id2Binlogs := lo.SliceToMap(loadInfo.BinlogPaths, func(fieldBinlog *datapb.FieldBinlog) (int64, *datapb.FieldBinlog) {
+		return fieldBinlog.GetFieldID(), fieldBinlog
+	})
 
 	schemaHelper, err := typeutil.CreateSchemaHelper(schema)
 	if err != nil {
 		log.Warn("failed to create schema helper", zap.String("name", schema.GetName()), zap.Error(err))
 		return nil, err
 	}
-	calculateDataSizeCount := 0
 	ctx := context.Background()
 
-	for _, fieldBinlog := range loadInfo.BinlogPaths {
-		fieldID := fieldBinlog.FieldID
-		var mmapEnabled bool
-		// TODO retrieve_enable should be considered
-		fieldSchema, err := schemaHelper.GetFieldFromID(fieldID)
-		if err != nil {
-			log.Warn("failed to get field schema", zap.Int64("fieldID", fieldID), zap.String("name", schema.GetName()), zap.Error(err))
-			return nil, err
-		}
-		binlogSize := uint64(getBinlogDataMemorySize(fieldBinlog))
-		isVectorType := typeutil.IsVectorType(fieldSchema.DataType)
-		shouldCalculateDataSize := false
+	// calculate data size
+	for _, fieldIndexInfo := range loadInfo.IndexInfos {
+		fieldID := fieldIndexInfo.GetFieldID()
+		if len(fieldIndexInfo.GetIndexFilePaths()) > 0 {
+			fieldSchema, err := schemaHelper.GetFieldFromID(fieldID)
+			if err != nil {
+				return nil, err
+			}
+			isVectorType := typeutil.IsVectorType(fieldSchema.GetDataType())
 
-		if fieldIndexInfo, ok := fieldID2IndexInfo[fieldID]; ok && len(fieldIndexInfo.GetIndexFilePaths()) > 0 {
 			var estimateResult ResourceEstimate
-			err := GetCLoadInfoWithFunc(ctx, fieldSchema, loadInfo, fieldIndexInfo, func(c *LoadIndexInfo) error {
+			err = GetCLoadInfoWithFunc(ctx, fieldSchema, loadInfo, fieldIndexInfo, func(c *LoadIndexInfo) error {
 				GetDynamicPool().Submit(func() (any, error) {
 					loadResourceRequest := C.EstimateLoadIndexResource(c.cLoadIndexInfo)
 					estimateResult = GetResourceEstimate(&loadResourceRequest)
@@ -1547,52 +1539,75 @@ func getResourceUsageEstimateOfSegment(schema *schemapb.CollectionSchema, loadIn
 			if vecindexmgr.GetVecIndexMgrInstance().IsGPUVecIndex(common.GetIndexType(fieldIndexInfo.IndexParams)) {
 				fieldGpuMemorySize = append(fieldGpuMemorySize, estimateResult.MaxMemoryCost)
 			}
-			if !estimateResult.HasRawData && !isVectorType {
-				shouldCalculateDataSize = true
+
+			// could skip binlog or
+			// could be missing for new field or storage v2 group 0
+			if estimateResult.HasRawData {
+				delete(id2Binlogs, fieldID)
+				continue
 			}
 
-			if !estimateResult.HasRawData && isVectorType {
-				metricType, err := funcutil.GetAttrByKeyFromRepeatedKV(common.MetricTypeKey, fieldIndexInfo.IndexParams)
-				if err != nil {
-					return nil, errors.Wrapf(err, "failed to estimate resource usage of index, metric type nout found, collection %d, segment %d, indexBuildID %d",
-						loadInfo.GetCollectionID(),
-						loadInfo.GetSegmentID(),
-						fieldIndexInfo.GetBuildID())
-				}
-				if metricType != metric.BM25 {
-					mmapVectorField := paramtable.Get().QueryNodeCfg.MmapVectorField.GetAsBool()
-					if mmapVectorField {
-						segmentDiskSize += binlogSize
-					} else {
-						segmentMemorySize += binlogSize
-					}
-				}
+			// BM25 only checks vector datatype
+			// scalar index does not have metrics type key
+			if !isVectorType {
+				continue
 			}
-		} else {
-			shouldCalculateDataSize = true
-			// querynode will generate a (memory type) intermin index for vector type
+
+			metricType, err := funcutil.GetAttrByKeyFromRepeatedKV(common.MetricTypeKey, fieldIndexInfo.IndexParams)
+			if err != nil {
+				return nil, errors.Wrapf(err, "failed to estimate resource usage of index, metric type not found, collection %d, segment %d, indexBuildID %d",
+					loadInfo.GetCollectionID(),
+					loadInfo.GetSegmentID(),
+					fieldIndexInfo.GetBuildID())
+			}
+			// skip raw data for BM25 index
+			if metricType == metric.BM25 {
+				delete(id2Binlogs, fieldID)
+			}
+		}
+	}
+
+	for fieldID, fieldBinlog := range id2Binlogs {
+		binlogSize := uint64(getBinlogDataMemorySize(fieldBinlog))
+		var isVectorType bool
+		var fieldSchema *schemapb.FieldSchema
+		if fieldID >= common.StartOfUserFieldID {
+			var err error
+			fieldSchema, err = schemaHelper.GetFieldFromID(fieldID)
+			if err != nil {
+				log.Warn("failed to get field schema", zap.Int64("fieldID", fieldID), zap.String("name", schema.GetName()), zap.Error(err))
+				return nil, err
+			}
+			isVectorType = typeutil.IsVectorType(fieldSchema.GetDataType())
 			interimIndexEnable := multiplyFactor.EnableInterminSegmentIndex && !isGrowingMmapEnable() && SupportInterimIndexDataType(fieldSchema.GetDataType())
 			if interimIndexEnable {
 				segmentMemorySize += uint64(float64(binlogSize) * multiplyFactor.tempSegmentIndexFactor)
 			}
 		}
 
-		if shouldCalculateDataSize {
-			calculateDataSizeCount += 1
-			mmapEnabled = isDataMmapEnable(fieldSchema)
-
-			if !mmapEnabled || common.IsSystemField(fieldSchema.GetFieldID()) {
-				segmentMemorySize += binlogSize
-				if DoubleMemorySystemField(fieldSchema.GetFieldID()) || DoubleMemoryDataType(fieldSchema.GetDataType()) {
-					segmentMemorySize += binlogSize
-				}
+		if isVectorType {
+			mmapVectorField := paramtable.Get().QueryNodeCfg.MmapVectorField.GetAsBool()
+			if mmapVectorField {
+				segmentDiskSize += binlogSize
 			} else {
-				segmentDiskSize += uint64(getBinlogDataDiskSize(fieldBinlog))
+				segmentMemorySize += binlogSize
 			}
+			continue
 		}
 
-		if mmapEnabled {
-			mmapFieldCount++
+		// missing mapping, shall be "0" group for storage v2
+		if fieldSchema == nil {
+			segmentMemorySize += binlogSize
+			continue
+		}
+		mmapEnabled := isDataMmapEnable(fieldSchema)
+		if !mmapEnabled || common.IsSystemField(fieldSchema.GetFieldID()) {
+			segmentMemorySize += binlogSize
+			if DoubleMemorySystemField(fieldSchema.GetFieldID()) || DoubleMemoryDataType(fieldSchema.GetDataType()) {
+				segmentMemorySize += binlogSize
+			}
+		} else {
+			segmentDiskSize += uint64(getBinlogDataDiskSize(fieldBinlog))
 		}
 	}
 
@@ -1702,23 +1717,12 @@ func (loader *segmentLoader) LoadIndex(ctx context.Context,
 	tr := timerecord.NewTimeRecorder("segmentLoader.LoadIndex")
 	defer metrics.QueryNodeLoadIndexLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID())).Observe(float64(tr.ElapseSpan().Milliseconds()))
 	for _, loadInfo := range infos {
-		fieldIDs := typeutil.NewSet(lo.Map(loadInfo.GetIndexInfos(), func(info *querypb.FieldIndexInfo, _ int) int64 { return info.GetFieldID() })...)
-		fieldInfos := lo.SliceToMap(lo.Filter(loadInfo.GetBinlogPaths(), func(info *datapb.FieldBinlog, _ int) bool { return fieldIDs.Contain(info.GetFieldID()) }),
-			func(info *datapb.FieldBinlog) (int64, *datapb.FieldBinlog) { return info.GetFieldID(), info })
-
 		for _, info := range loadInfo.GetIndexInfos() {
 			if len(info.GetIndexFilePaths()) == 0 {
 				log.Warn("failed to add index for segment, index file list is empty, the segment may be too small")
 				return merr.WrapErrIndexNotFound("index file list empty")
 			}
 
-			// TODO add field info sync between segcore and go segment for storage v2
-			if loadInfo.GetStorageVersion() != storage.StorageV2 {
-				fieldInfo, ok := fieldInfos[info.GetFieldID()]
-				if !ok {
-					return merr.WrapErrParameterInvalid("index info with corresponding field info", "missing field info", strconv.FormatInt(fieldInfo.GetFieldID(), 10))
-				}
-			}
 			err := loader.loadFieldIndex(ctx, segment, info)
 			if err != nil {
 				log.Warn("failed to load index for segment", zap.Error(err))
@@ -1738,6 +1742,10 @@ func (loader *segmentLoader) LoadJSONIndex(ctx context.Context,
 	segment, ok := seg.(*LocalSegment)
 	if !ok {
 		return merr.WrapErrParameterInvalid("LocalSegment", fmt.Sprintf("%T", seg))
+	}
+
+	if len(loadInfo.GetJsonKeyStatsLogs()) == 0 {
+		return nil
 	}
 
 	collection := segment.GetCollection()

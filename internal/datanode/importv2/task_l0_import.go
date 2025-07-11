@@ -99,7 +99,12 @@ func (t *L0ImportTask) GetSchema() *schemapb.CollectionSchema {
 }
 
 func (t *L0ImportTask) GetSlots() int64 {
-	return 1
+	return t.req.GetTaskSlot()
+}
+
+// L0 import task buffer size is fixed
+func (t *L0ImportTask) GetBufferSize() int64 {
+	return paramtable.Get().DataNodeCfg.ImportBaseBufferSize.GetAsInt64()
 }
 
 func (t *L0ImportTask) Cancel() {
@@ -127,17 +132,22 @@ func (t *L0ImportTask) Clone() Task {
 }
 
 func (t *L0ImportTask) Execute() []*conc.Future[any] {
-	bufferSize := paramtable.Get().DataNodeCfg.ReadBufferSizeInMB.GetAsInt() * 1024 * 1024
+	bufferSize := int(t.GetBufferSize())
 	log.Info("start to import l0", WrapLogFields(t,
 		zap.Int("bufferSize", bufferSize),
+		zap.Int64("taskSlot", t.GetSlots()),
 		zap.Any("schema", t.GetSchema()))...)
 	t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_InProgress))
 
 	fn := func() (err error) {
 		defer func() {
 			if err != nil {
-				log.Warn("l0 import task execute failed", WrapLogFields(t, zap.Error(err))...)
-				t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(err.Error()))
+				var reason string = err.Error()
+				if len(t.req.GetFiles()) == 1 {
+					reason = fmt.Sprintf("error: %v, file: %s", err, t.req.GetFiles()[0].String())
+				}
+				log.Warn("l0 import task execute failed", WrapLogFields(t, zap.Any("file", t.req.GetFiles()), zap.String("err", reason))...)
+				t.manager.Update(t.GetTaskID(), UpdateState(datapb.ImportTaskStateV2_Failed), UpdateReason(reason))
 			}
 		}()
 
@@ -226,11 +236,12 @@ func (t *L0ImportTask) syncDelete(delData []*storage.DeleteData) ([]*conc.Future
 			return nil, nil, err
 		}
 		syncTask, err := NewSyncTask(t.ctx, t.allocator, t.metaCaches, t.req.GetTs(),
-			segmentID, partitionID, t.GetCollectionID(), channel, nil, data, nil)
+			segmentID, partitionID, t.GetCollectionID(), channel, nil, data,
+			nil, t.req.GetStorageVersion(), t.req.GetStorageConfig())
 		if err != nil {
 			return nil, nil, err
 		}
-		future, err := t.syncMgr.SyncData(t.ctx, syncTask)
+		future, err := t.syncMgr.SyncDataWithChunkManager(t.ctx, syncTask, t.cm)
 		if err != nil {
 			log.Ctx(context.TODO()).Error("failed to sync l0 delete data", WrapLogFields(t, zap.Error(err))...)
 			return nil, nil, err

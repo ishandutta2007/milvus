@@ -88,10 +88,6 @@ type searchTask struct {
 	queryInfos      []*planpb.QueryInfo
 	relatedDataSize int64
 
-	// Will be deprecated, use functionScore after milvus 2.6
-	reScorers   []reScorer
-	groupScorer func(group *Group) error
-
 	// New reranker functions
 	functionScore *rerank.FunctionScore
 	rankParams    *rankParams
@@ -271,12 +267,20 @@ func (t *searchTask) PreExecute(ctx context.Context) error {
 	}
 
 	if collectionInfo.collectionTTL != 0 {
-		physicalTime, _ := tsoutil.ParseTS(guaranteeTs)
+		physicalTime := tsoutil.PhysicalTime(t.GetBase().GetTimestamp())
 		expireTime := physicalTime.Add(-time.Duration(collectionInfo.collectionTTL))
 		t.CollectionTtlTimestamps = tsoutil.ComposeTSByTime(expireTime, 0)
+		// preventing overflow, abort
+		if t.CollectionTtlTimestamps > t.GetBase().GetTimestamp() {
+			return merr.WrapErrServiceInternal(fmt.Sprintf("ttl timestamp overflow, base timestamp: %d, ttl duration %v", t.GetBase().GetTimestamp(), collectionInfo.collectionTTL))
+		}
 	}
 
 	t.resultBuf = typeutil.NewConcurrentSet[*internalpb.SearchResults]()
+
+	if err = ValidateTask(t); err != nil {
+		return err
+	}
 
 	log.Debug("search PreExecute done.",
 		zap.Uint64("guarantee_ts", guaranteeTs),
@@ -374,22 +378,10 @@ func (t *searchTask) initAdvancedSearchRequest(ctx context.Context) error {
 			return err
 		}
 	} else {
-		t.reScorers, err = NewReScorers(ctx, len(t.request.GetSubReqs()), t.request.GetSearchParams())
-		if err != nil {
-			log.Info("generate reScorer failed", zap.Any("params", t.request.GetSearchParams()), zap.Error(err))
+		if t.functionScore, err = rerank.NewFunctionScoreWithlegacy(t.schema.CollectionSchema, t.request.GetSearchParams()); err != nil {
+			log.Warn("Failed to create function by legacy info", zap.Error(err))
 			return err
 		}
-
-		// set up groupScorer for hybridsearch+groupBy
-		groupScorerStr, err := funcutil.GetAttrByKeyFromRepeatedKV(RankGroupScorer, t.request.GetSearchParams())
-		if err != nil {
-			groupScorerStr = MaxScorer
-		}
-		groupScorer, err := GetGroupScorer(groupScorerStr)
-		if err != nil {
-			return err
-		}
-		t.groupScorer = groupScorer
 	}
 
 	t.needRequery = len(t.request.OutputFields) > 0 || len(t.functionScore.GetAllInputFieldNames()) > 0
@@ -540,22 +532,12 @@ func (t *searchTask) advancedPostProcess(ctx context.Context, span trace.Span, t
 			return err
 		}
 
-		if t.functionScore == nil {
-			t.reScorers[index].setMetricType(subMetricType)
-			t.reScorers[index].reScore(result)
-		}
 		searchMetrics = append(searchMetrics, subMetricType)
 		multipleMilvusResults[index] = result
 	}
 
-	if t.functionScore == nil {
-		if err := t.rank(ctx, span, multipleMilvusResults); err != nil {
-			return err
-		}
-	} else {
-		if err := t.hybridSearchRank(ctx, span, multipleMilvusResults, searchMetrics); err != nil {
-			return err
-		}
+	if err := t.hybridSearchRank(ctx, span, multipleMilvusResults, searchMetrics); err != nil {
+		return err
 	}
 
 	t.result.Results.FieldsData = lo.Filter(t.result.Results.FieldsData, func(fieldData *schemapb.FieldData, i int) bool {
@@ -579,75 +561,42 @@ func (t *searchTask) fillResult() {
 	t.fillInFieldInfo()
 }
 
-// TODO: Old version rerank: rrf/weighted, subsequent unified rerank implementation
-func (t *searchTask) rank(ctx context.Context, span trace.Span, multipleMilvusResults []*milvuspb.SearchResults) error {
-	primaryFieldSchema, err := t.schema.GetPkField()
-	if err != nil {
-		log.Warn("failed to get primary field schema", zap.Error(err))
-		return err
-	}
-	if t.result, err = rankSearchResultData(ctx, t.SearchRequest.GetNq(),
-		t.rankParams,
-		primaryFieldSchema.GetDataType(),
-		multipleMilvusResults,
-		t.SearchRequest.GetGroupByFieldId(),
-		t.SearchRequest.GetGroupSize(),
-		t.groupScorer); err != nil {
-		log.Warn("rank search result failed", zap.Error(err))
-		return err
-	}
-
-	if t.needRequery {
-		if t.requeryFunc == nil {
-			t.requeryFunc = requeryImpl
-		}
-		queryResult, err := t.requeryFunc(t, span, t.result.Results.Ids, t.translatedOutputFields)
-		if err != nil {
-			log.Warn("failed to requery", zap.Error(err))
-			return err
-		}
-		fields, err := t.reorganizeRequeryResults(ctx, queryResult.GetFieldsData(), []*schemapb.IDs{t.result.Results.Ids})
-		if err != nil {
-			return err
-		}
-		t.result.Results.FieldsData = fields[0]
-	}
-
-	return nil
-}
-
 func mergeIDs(idsList []*schemapb.IDs) (*schemapb.IDs, int) {
 	uniqueIDs := &schemapb.IDs{}
-	count := 0
-	switch idsList[0].GetIdField().(type) {
-	case *schemapb.IDs_IntId:
-		idsSet := typeutil.NewSet[int64]()
-		for _, ids := range idsList {
-			if data := ids.GetIntId().GetData(); data != nil {
-				idsSet.Insert(data...)
-			}
+	int64IDs := typeutil.NewSet[int64]()
+	strIDs := typeutil.NewSet[string]()
+
+	for _, ids := range idsList {
+		if ids == nil {
+			continue
 		}
-		count = idsSet.Len()
-		uniqueIDs.IdField = &schemapb.IDs_IntId{
-			IntId: &schemapb.LongArray{
-				Data: idsSet.Collect(),
-			},
-		}
-	case *schemapb.IDs_StrId:
-		idsSet := typeutil.NewSet[string]()
-		for _, ids := range idsList {
-			if data := ids.GetStrId().GetData(); data != nil {
-				idsSet.Insert(data...)
-			}
-		}
-		count = idsSet.Len()
-		uniqueIDs.IdField = &schemapb.IDs_StrId{
-			StrId: &schemapb.StringArray{
-				Data: idsSet.Collect(),
-			},
+		switch ids.GetIdField().(type) {
+		case *schemapb.IDs_IntId:
+			int64IDs.Insert(ids.GetIntId().GetData()...)
+		case *schemapb.IDs_StrId:
+			strIDs.Insert(ids.GetStrId().GetData()...)
 		}
 	}
-	return uniqueIDs, count
+
+	if int64IDs.Len() > 0 {
+		uniqueIDs.IdField = &schemapb.IDs_IntId{
+			IntId: &schemapb.LongArray{
+				Data: int64IDs.Collect(),
+			},
+		}
+		return uniqueIDs, int64IDs.Len()
+	}
+
+	if strIDs.Len() > 0 {
+		uniqueIDs.IdField = &schemapb.IDs_StrId{
+			StrId: &schemapb.StringArray{
+				Data: strIDs.Collect(),
+			},
+		}
+		return uniqueIDs, strIDs.Len()
+	}
+
+	return nil, 0
 }
 
 func (t *searchTask) hybridSearchRank(ctx context.Context, span trace.Span, multipleMilvusResults []*milvuspb.SearchResults, searchMetrics []string) error {
@@ -655,10 +604,10 @@ func (t *searchTask) hybridSearchRank(ctx context.Context, span trace.Span, mult
 	processRerank := func(ctx context.Context, results []*milvuspb.SearchResults) (*milvuspb.SearchResults, error) {
 		ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-call-rerank-function-udf")
 		defer sp.End()
-
+		groupScorerStr := getGroupScorerStr(t.request.GetSearchParams())
 		params := rerank.NewSearchParams(
 			t.Nq, t.rankParams.limit, t.rankParams.offset, t.rankParams.roundDecimal,
-			t.rankParams.groupByFieldId, t.rankParams.groupSize, t.rankParams.strictGroupSize, searchMetrics,
+			t.rankParams.groupByFieldId, t.rankParams.groupSize, t.rankParams.strictGroupSize, groupScorerStr, searchMetrics,
 		)
 		return t.functionScore.Process(ctx, params, results)
 	}
@@ -699,6 +648,7 @@ func (t *searchTask) hybridSearchRank(ctx context.Context, span trace.Span, mult
 		for i := 0; i < len(multipleMilvusResults); i++ {
 			multipleMilvusResults[i].Results.FieldsData = fields[i]
 		}
+
 		if t.result, err = processRerank(ctx, multipleMilvusResults); err != nil {
 			return err
 		}
@@ -834,8 +784,9 @@ func (t *searchTask) searchPostProcess(ctx context.Context, span trace.Span, toR
 		{
 			ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-call-rerank-function-udf")
 			defer sp.End()
+			groupScorerStr := getGroupScorerStr(t.request.GetSearchParams())
 			params := rerank.NewSearchParams(t.Nq, t.SearchRequest.GetTopk(), t.SearchRequest.GetOffset(),
-				t.queryInfos[0].RoundDecimal, t.queryInfos[0].GroupByFieldId, t.queryInfos[0].GroupSize, t.queryInfos[0].StrictGroupSize, []string{metricType})
+				t.queryInfos[0].RoundDecimal, t.queryInfos[0].GroupByFieldId, t.queryInfos[0].GroupSize, t.queryInfos[0].StrictGroupSize, groupScorerStr, []string{metricType})
 			// rank only returns id and score
 			if t.result, err = t.functionScore.Process(ctx, params, []*milvuspb.SearchResults{result}); err != nil {
 				return err

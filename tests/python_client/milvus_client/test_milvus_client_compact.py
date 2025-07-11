@@ -125,7 +125,7 @@ class TestMilvusClientCompactValid(TestMilvusClientV2Base):
     def supported_varchar_scalar_index(self, request):
         yield request.param
 
-    @pytest.fixture(scope="function", params=["DOUBLE", "VARCHAR", "BOOL", "double", "varchar", "bool"])
+    @pytest.fixture(scope="function", params=["DOUBLE", "VARCHAR", 'json', "bool"])
     def supported_json_cast_type(self, request):
         yield request.param
 
@@ -136,7 +136,8 @@ class TestMilvusClientCompactValid(TestMilvusClientV2Base):
     """
 
     @pytest.mark.tags(CaseLabel.L1)
-    def test_milvus_client_compact_normal(self, is_clustering):
+    @pytest.mark.parametrize("add_field", [True, False])
+    def test_milvus_client_compact_normal(self, is_clustering, add_field):
         """
         target: test hybrid search with default normal case (2 vector fields)
         method: create connection, collection, insert and hybrid search
@@ -163,6 +164,14 @@ class TestMilvusClientCompactValid(TestMilvusClientV2Base):
              default_vector_field_name+"new": list(rng.random((1, default_dim))[0]),
              default_string_field_name: str(i)} for i in range(10*default_nb)]
         self.insert(client, collection_name, rows)
+        if add_field and not is_clustering:
+            self.add_collection_field(client, collection_name, field_name="field_new", data_type=DataType.INT64,
+                                      nullable=True, is_clustering_key=True)
+            rows_new = [
+                {default_primary_key_field_name: i, default_vector_field_name: list(rng.random((1, default_dim))[0]),
+                 default_vector_field_name+"new": list(rng.random((1, default_dim))[0]),
+                 default_string_field_name: str(i)} for i in range(10*default_nb, 11*default_nb)]
+            self.insert(client, collection_name, rows_new)
         self.flush(client, collection_name)
         # 3. compact
         compact_id = self.compact(client, collection_name, is_clustering=is_clustering)[0]

@@ -19,6 +19,7 @@ package querynodev2
 /*
 #cgo pkg-config: milvus_core
 
+#include "common/type_c.h"
 #include "segcore/collection_c.h"
 #include "segcore/segment_c.h"
 #include "segcore/segcore_init_c.h"
@@ -65,12 +66,14 @@ import (
 	"github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/internal/util/streamingutil"
+	"github.com/milvus-io/milvus/internal/util/streamingutil/util"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/config"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/mq/msgdispatcher"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/streaming/walimpls/impls/rmq"
 	"github.com/milvus-io/milvus/pkg/v2/util/expr"
 	"github.com/milvus-io/milvus/pkg/v2/util/hardware"
 	"github.com/milvus-io/milvus/pkg/v2/util/lifetime"
@@ -198,13 +201,32 @@ func ResizeHighPriorityPool(evt *config.Event) {
 	}
 }
 
+func (node *QueryNode) ReconfigFileWriterParams(evt *config.Event) {
+	if evt.HasUpdated {
+		if err := initcore.InitFileWriterConfig(paramtable.Get()); err != nil {
+			log.Ctx(node.ctx).Warn("QueryNode failed to reconfigure file writer params", zap.Error(err))
+			return
+		}
+		log.Ctx(node.ctx).Info("QueryNode reconfig file writer params successfully",
+			zap.String("mode", paramtable.Get().CommonCfg.DiskWriteMode.GetValue()),
+			zap.Uint64("bufferSize", paramtable.Get().CommonCfg.DiskWriteBufferSizeKb.GetAsUint64()),
+			zap.Int("nrThreads", paramtable.Get().CommonCfg.DiskWriteNumThreads.GetAsInt()))
+	}
+}
+
 func (node *QueryNode) RegisterSegcoreConfigWatcher() {
 	pt := paramtable.Get()
 	pt.Watch(pt.CommonCfg.HighPriorityThreadCoreCoefficient.Key,
 		config.NewHandler("common.threadCoreCoefficient.highPriority", ResizeHighPriorityPool))
+	pt.Watch(pt.CommonCfg.DiskWriteMode.Key,
+		config.NewHandler("common.diskWriteMode", node.ReconfigFileWriterParams))
+	pt.Watch(pt.CommonCfg.DiskWriteBufferSizeKb.Key,
+		config.NewHandler("common.diskWriteBufferSizeKb", node.ReconfigFileWriterParams))
+	pt.Watch(pt.CommonCfg.DiskWriteNumThreads.Key,
+		config.NewHandler("common.diskWriteNumThreads", node.ReconfigFileWriterParams))
 }
 
-// InitSegcore set init params of segCore, such as chunckRows, SIMD type...
+// InitSegcore set init params of segCore, such as chunkRows, SIMD type...
 func (node *QueryNode) InitSegcore() error {
 	cGlogConf := C.CString(path.Join(paramtable.GetBaseTable().GetConfigDir(), paramtable.DefaultGlogConf))
 	C.SegcoreInit(cGlogConf)
@@ -238,6 +260,7 @@ func (node *QueryNode) InitSegcore() error {
 	C.InitMiddlePriorityThreadCoreCoefficient(cMiddlePriorityThreadCoreCoefficient)
 	cLowPriorityThreadCoreCoefficient := C.float(paramtable.Get().CommonCfg.LowPriorityThreadCoreCoefficient.GetAsFloat())
 	C.InitLowPriorityThreadCoreCoefficient(cLowPriorityThreadCoreCoefficient)
+
 	node.RegisterSegcoreConfigWatcher()
 
 	cCPUNum := C.int(hardware.GetCPUNum())
@@ -277,6 +300,11 @@ func (node *QueryNode) InitSegcore() error {
 		return err
 	}
 
+	err = initcore.InitFileWriterConfig(paramtable.Get())
+	if err != nil {
+		return err
+	}
+
 	err = initcore.InitStorageV2FileSystem(paramtable.Get())
 	if err != nil {
 		return err
@@ -295,6 +323,15 @@ func (node *QueryNode) InitSegcore() error {
 	vectorFieldCacheWarmupPolicy, err := segcore.ConvertCacheWarmupPolicy(paramtable.Get().QueryNodeCfg.TieredWarmupVectorField.GetValue())
 	if err != nil {
 		return err
+	}
+	deprecatedCacheWarmupPolicy := paramtable.Get().QueryNodeCfg.ChunkCacheWarmingUp.GetValue()
+	if deprecatedCacheWarmupPolicy == "sync" {
+		log.Warn("queryNode.cache.warmup is being deprecated, use queryNode.segcore.tieredStorage.warmup.vectorField instead.")
+		log.Warn("for now, if queryNode.cache.warmup is set to sync, it will override queryNode.segcore.tieredStorage.warmup.vectorField to sync.")
+		log.Warn("otherwise, queryNode.cache.warmup will be ignored")
+		vectorFieldCacheWarmupPolicy = C.CacheWarmupPolicy_Sync
+	} else if deprecatedCacheWarmupPolicy == "async" {
+		log.Warn("queryNode.cache.warmup is being deprecated and ignored, use queryNode.segcore.tieredStorage.warmup.vectorField instead.")
 	}
 	scalarIndexCacheWarmupPolicy, err := segcore.ConvertCacheWarmupPolicy(paramtable.Get().QueryNodeCfg.TieredWarmupScalarIndex.GetValue())
 	if err != nil {
@@ -477,7 +514,7 @@ func (node *QueryNode) Init() error {
 		node.loader = segments.NewLoader(node.ctx, node.manager, node.chunkManager)
 		node.manager.SetLoader(node.loader)
 		if streamingutil.IsStreamingServiceEnabled() {
-			node.dispClient = msgdispatcher.NewClient(streaming.NewDelegatorMsgstreamFactory(), typeutil.QueryNodeRole, node.GetNodeID())
+			node.dispClient = msgdispatcher.NewClientWithIncludeSkipWhenSplit(streaming.NewDelegatorMsgstreamFactory(), typeutil.QueryNodeRole, node.GetNodeID())
 		} else {
 			node.dispClient = msgdispatcher.NewClient(node.factory, typeutil.QueryNodeRole, node.GetNodeID())
 		}
@@ -541,7 +578,7 @@ func (node *QueryNode) Stop() error {
 		err := node.session.GoingStop()
 		if err != nil {
 			log.Warn("session fail to go stopping state", zap.Error(err))
-		} else {
+		} else if util.MustSelectWALName() != rmq.WALName { // rocksmq cannot support querynode graceful stop because of using local storage.
 			metrics.StoppingBalanceNodeNum.WithLabelValues().Set(1)
 			// TODO: Redundant timeout control, graceful stop timeout is controlled by outside by `component`.
 			// Integration test is still using it, Remove it in future.
@@ -561,6 +598,9 @@ func (node *QueryNode) Stop() error {
 				}
 				if node.pipelineManager != nil {
 					channelNum = node.pipelineManager.Num()
+				}
+				if len(sealedSegments) == 0 && len(growingSegments) == 0 && channelNum == 0 {
+					break outer
 				}
 
 				select {

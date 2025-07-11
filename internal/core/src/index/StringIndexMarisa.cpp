@@ -38,6 +38,7 @@
 #include "index/Index.h"
 #include "marisa/base.h"
 #include "storage/Util.h"
+#include "storage/FileWriter.h"
 
 namespace milvus::index {
 
@@ -189,19 +190,16 @@ StringIndexMarisa::LoadWithoutAssemble(const BinarySet& set,
     auto index = set.GetByName(MARISA_TRIE_INDEX);
     auto len = index->size;
 
-    auto file = File::Open(file_name, O_RDWR | O_CREAT | O_EXCL);
-    auto written = file.Write(index->data.get(), len);
-    if (written != len) {
-        file.Close();
-        remove(file_name.c_str());
-        PanicInfo(ErrorCode::UnistdError,
-                  fmt::format("write index to fd error: {}", strerror(errno)));
+    {
+        auto file_writer = storage::FileWriter(file_name);
+        file_writer.Write(index->data.get(), len);
+        file_writer.Finish();
     }
 
-    file.Seek(0, SEEK_SET);
     if (config.contains(MMAP_FILE_PATH)) {
         trie_.mmap(file_name.c_str());
     } else {
+        auto file = File::Open(file_name, O_RDONLY);
         trie_.read(file.Descriptor());
     }
     // make sure the file would be removed after we unmap & close it
@@ -228,7 +226,8 @@ StringIndexMarisa::Load(milvus::tracer::TraceContext ctx,
         GetValueFromConfig<std::vector<std::string>>(config, "index_files");
     AssertInfo(index_files.has_value(),
                "index file paths is empty when load index");
-    auto index_datas = file_manager_->LoadIndexToMemory(index_files.value());
+    auto index_datas = file_manager_->LoadIndexToMemory(
+        index_files.value(), config[milvus::LOAD_PRIORITY]);
     BinarySet binary_set;
     AssembleIndexDatas(index_datas, binary_set);
     LoadWithoutAssemble(binary_set, config);
@@ -264,31 +263,43 @@ StringIndexMarisa::NotIn(size_t n, const std::string* values) {
         }
     }
     // NotIn(null) and In(null) is both false, need to mask with IsNotNull operate
-    auto offsets = str_ids_to_offsets_[MARISA_NULL_KEY_ID];
-    for (size_t i = 0; i < offsets.size(); i++) {
-        bitset.reset(offsets[i]);
-    }
+    ResetNull(bitset);
     return bitset;
 }
 
 const TargetBitmap
 StringIndexMarisa::IsNull() {
     TargetBitmap bitset(str_ids_.size());
-    auto offsets = str_ids_to_offsets_[MARISA_NULL_KEY_ID];
-    for (size_t i = 0; i < offsets.size(); i++) {
-        bitset.set(offsets[i]);
-    }
+    SetNull(bitset);
     return bitset;
+}
+
+void
+StringIndexMarisa::SetNull(TargetBitmap& bitset) {
+    for (size_t i = 0; i < bitset.size(); i++) {
+        if (str_ids_[i] == MARISA_NULL_KEY_ID) {
+            bitset.set(i);
+        }
+    }
+}
+
+void
+StringIndexMarisa::ResetNull(TargetBitmap& bitset) {
+    for (size_t i = 0; i < bitset.size(); i++) {
+        if (str_ids_[i] == MARISA_NULL_KEY_ID) {
+            bitset.reset(i);
+        }
+    }
 }
 
 const TargetBitmap
 StringIndexMarisa::IsNotNull() {
     TargetBitmap bitset(str_ids_.size());
-    auto offsets = str_ids_to_offsets_[MARISA_NULL_KEY_ID];
-    for (size_t i = 0; i < offsets.size(); i++) {
-        bitset.set(offsets[i]);
+    for (size_t i = 0; i < bitset.size(); i++) {
+        if (str_ids_[i] != MARISA_NULL_KEY_ID) {
+            bitset.set(i);
+        }
     }
-    bitset.flip();
     return bitset;
 }
 

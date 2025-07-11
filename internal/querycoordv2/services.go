@@ -224,6 +224,8 @@ func (s *Server) LoadCollection(ctx context.Context, req *querypb.LoadCollection
 		return merr.Status(err), nil
 	}
 
+	// if user specified the replica number in load request, load config changes won't be apply to the collection automatically
+	userSpecifiedReplicaMode := req.GetReplicaNumber() > 0
 	// to be compatible with old sdk, which set replica=1 if replica is not specified
 	// so only both replica and resource groups didn't set in request, it will turn to use the configured load info
 	if req.GetReplicaNumber() <= 0 && len(req.GetResourceGroups()) == 0 {
@@ -277,6 +279,7 @@ func (s *Server) LoadCollection(ctx context.Context, req *querypb.LoadCollection
 				s.targetMgr,
 				s.targetObserver,
 				s.collectionObserver,
+				userSpecifiedReplicaMode,
 			)
 		}
 	}
@@ -291,6 +294,7 @@ func (s *Server) LoadCollection(ctx context.Context, req *querypb.LoadCollection
 			s.targetObserver,
 			s.collectionObserver,
 			s.nodeMgr,
+			userSpecifiedReplicaMode,
 		)
 	}
 
@@ -377,6 +381,9 @@ func (s *Server) LoadPartitions(ctx context.Context, req *querypb.LoadPartitions
 		return merr.Status(err), nil
 	}
 
+	// if user specified the replica number in load request, load config changes won't be apply to the collection automatically
+	userSpecifiedReplicaMode := req.GetReplicaNumber() > 0
+
 	// to be compatible with old sdk, which set replica=1 if replica is not specified
 	// so only both replica and resource groups didn't set in request, it will turn to use the configured load info
 	if req.GetReplicaNumber() <= 0 && len(req.GetResourceGroups()) == 0 {
@@ -406,6 +413,7 @@ func (s *Server) LoadPartitions(ctx context.Context, req *querypb.LoadPartitions
 		s.targetObserver,
 		s.collectionObserver,
 		s.nodeMgr,
+		userSpecifiedReplicaMode,
 	)
 	s.jobScheduler.Add(loadJob)
 	err := loadJob.Wait()
@@ -1216,6 +1224,7 @@ func (s *Server) UpdateLoadConfig(ctx context.Context, req *querypb.UpdateLoadCo
 			s.targetMgr,
 			s.targetObserver,
 			s.collectionObserver,
+			false,
 		)
 
 		jobs = append(jobs, updateJob)
@@ -1238,4 +1247,36 @@ func (s *Server) UpdateLoadConfig(ctx context.Context, req *querypb.UpdateLoadCo
 	log.Info("update load config request finished")
 
 	return merr.Success(), nil
+}
+
+func (s *Server) ListLoadedSegments(ctx context.Context, req *querypb.ListLoadedSegmentsRequest) (*querypb.ListLoadedSegmentsResponse, error) {
+	if err := merr.CheckHealthy(s.State()); err != nil {
+		return &querypb.ListLoadedSegmentsResponse{
+			Status: merr.Status(errors.Wrap(err, "failed to list loaded segments")),
+		}, nil
+	}
+	segmentIDs := typeutil.NewUniqueSet()
+
+	collections := s.meta.GetAllCollections(ctx)
+	for _, collection := range collections {
+		segments := s.targetMgr.GetSealedSegmentsByCollection(ctx, collection.GetCollectionID(), meta.CurrentTarget)
+		for _, segment := range segments {
+			segmentIDs.Insert(segment.ID)
+		}
+		segments = s.targetMgr.GetSealedSegmentsByCollection(ctx, collection.GetCollectionID(), meta.NextTarget)
+		for _, segment := range segments {
+			segmentIDs.Insert(segment.ID)
+		}
+	}
+
+	segments := s.dist.SegmentDistManager.GetByFilter()
+	for _, segment := range segments {
+		segmentIDs.Insert(segment.ID)
+	}
+
+	resp := &querypb.ListLoadedSegmentsResponse{
+		Status:     merr.Success(),
+		SegmentIDs: segmentIDs.Collect(),
+	}
+	return resp, nil
 }

@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -162,6 +163,10 @@ type shardDelegator struct {
 
 	// current forward policy
 	l0ForwardPolicy string
+
+	// schema version
+	schemaChangeMutex sync.RWMutex
+	schemaVersion     uint64
 }
 
 // getLogger returns the zap logger with pre-defined shard attributes.
@@ -173,13 +178,27 @@ func (sd *shardDelegator) getLogger(ctx context.Context) *log.MLogger {
 	)
 }
 
+func (sd *shardDelegator) NotStopped(state lifetime.State) error {
+	if state != lifetime.Stopped {
+		return nil
+	}
+	return merr.WrapErrChannelNotAvailable(sd.vchannelName, fmt.Sprintf("delegator is not ready, state: %s", state.String()))
+}
+
+func (sd *shardDelegator) IsWorking(state lifetime.State) error {
+	if state == lifetime.Working {
+		return nil
+	}
+	return merr.WrapErrChannelNotAvailable(sd.vchannelName, fmt.Sprintf("delegator is not ready, state: %s", state.String()))
+}
+
 // Serviceable returns whether delegator is serviceable now.
 func (sd *shardDelegator) Serviceable() bool {
-	return lifetime.IsWorking(sd.lifetime.GetState()) == nil
+	return sd.IsWorking(sd.lifetime.GetState()) == nil
 }
 
 func (sd *shardDelegator) Stopped() bool {
-	return lifetime.NotStopped(sd.lifetime.GetState()) != nil
+	return sd.NotStopped(sd.lifetime.GetState()) != nil
 }
 
 // Start sets delegator to working state.
@@ -349,7 +368,7 @@ func (sd *shardDelegator) search(ctx context.Context, req *querypb.SearchRequest
 		return nil, err
 	}
 
-	log.Debug("Delegator search done")
+	log.Debug("Delegator search done", zap.Int("results", len(results)))
 
 	return results, nil
 }
@@ -357,7 +376,7 @@ func (sd *shardDelegator) search(ctx context.Context, req *querypb.SearchRequest
 // Search preforms search operation on shard.
 func (sd *shardDelegator) Search(ctx context.Context, req *querypb.SearchRequest) ([]*internalpb.SearchResults, error) {
 	log := sd.getLogger(ctx)
-	if err := sd.lifetime.Add(lifetime.IsWorking); err != nil {
+	if err := sd.lifetime.Add(sd.IsWorking); err != nil {
 		return nil, err
 	}
 	defer sd.lifetime.Done()
@@ -563,7 +582,7 @@ func (sd *shardDelegator) QueryStream(ctx context.Context, req *querypb.QueryReq
 // Query performs query operation on shard.
 func (sd *shardDelegator) Query(ctx context.Context, req *querypb.QueryRequest) ([]*internalpb.RetrieveResults, error) {
 	log := sd.getLogger(ctx)
-	if err := sd.lifetime.Add(lifetime.IsWorking); err != nil {
+	if err := sd.lifetime.Add(sd.IsWorking); err != nil {
 		return nil, err
 	}
 	defer sd.lifetime.Done()
@@ -651,6 +670,23 @@ func (sd *shardDelegator) Query(ctx context.Context, req *querypb.QueryRequest) 
 	}
 
 	log.Debug("Delegator Query done")
+	if log.Core().Enabled(zap.DebugLevel) {
+		sealedIDs := lo.FlatMap(sealed, func(item SnapshotItem, _ int) []int64 {
+			return lo.Map(item.Segments, func(segment SegmentEntry, _ int) int64 {
+				return segment.SegmentID
+			})
+		})
+		slices.Sort(sealedIDs)
+		growingIDs := lo.Map(growing, func(item SegmentEntry, _ int) int64 {
+			return item.SegmentID
+		})
+		slices.Sort(growingIDs)
+		log.Debug("execute count on segments...",
+			zap.Int64s("sealedIDs", sealedIDs),
+			zap.Int64s("growingIDs", growingIDs),
+			zap.Int64("targetVersion", sd.distribution.queryView.version),
+		)
+	}
 
 	return results, nil
 }
@@ -658,7 +694,7 @@ func (sd *shardDelegator) Query(ctx context.Context, req *querypb.QueryRequest) 
 // GetStatistics returns statistics aggregated by delegator.
 func (sd *shardDelegator) GetStatistics(ctx context.Context, req *querypb.GetStatisticsRequest) ([]*internalpb.GetStatisticsResponse, error) {
 	log := sd.getLogger(ctx)
-	if err := sd.lifetime.Add(lifetime.IsWorking); err != nil {
+	if err := sd.lifetime.Add(sd.IsWorking); err != nil {
 		return nil, err
 	}
 	defer sd.lifetime.Done()
@@ -900,7 +936,7 @@ func (sd *shardDelegator) speedupGuranteeTS(
 		return guaranteeTS
 	}
 	// use the mvcc timestamp of the wal as the guarantee timestamp to make fast strong consistency search.
-	if mvcc, err := streaming.WAL().GetLatestMVCCTimestampIfLocal(ctx, sd.vchannelName); err == nil && mvcc < guaranteeTS {
+	if mvcc, err := streaming.WAL().Local().GetLatestMVCCTimestampIfLocal(ctx, sd.vchannelName); err == nil && mvcc < guaranteeTS {
 		return mvcc
 	}
 	return guaranteeTS
@@ -976,18 +1012,21 @@ func (sd *shardDelegator) GetTSafe() uint64 {
 
 func (sd *shardDelegator) UpdateSchema(ctx context.Context, schema *schemapb.CollectionSchema, schVersion uint64) error {
 	log := sd.getLogger(ctx)
-	if err := sd.lifetime.Add(lifetime.IsWorking); err != nil {
+	if err := sd.lifetime.Add(sd.IsWorking); err != nil {
 		return err
 	}
 	defer sd.lifetime.Done()
 
 	log.Info("delegator received update schema event")
 
-	sealed, growing, version, err := sd.distribution.PinReadableSegments(1.0)
-	if err != nil {
-		log.Warn("delegator failed to query, current distribution is not serviceable", zap.Error(err))
-		return err
-	}
+	sd.schemaChangeMutex.Lock()
+	defer sd.schemaChangeMutex.Unlock()
+
+	// set updated schema version as load barrier
+	// prevent concurrent load segment with old schema
+	sd.schemaVersion = schVersion
+
+	sealed, growing, version := sd.distribution.PinOnlineSegments()
 	defer sd.distribution.Unpin(version)
 
 	log.Info("update schema targets...",
@@ -1041,6 +1080,12 @@ func (sd *shardDelegator) Close() {
 	// clean idf oracle
 	if sd.idfOracle != nil {
 		sd.idfOracle.Close()
+	}
+
+	if sd.functionRunners != nil {
+		for _, function := range sd.functionRunners {
+			function.Close()
+		}
 	}
 
 	// clean up l0 segment in delete buffer

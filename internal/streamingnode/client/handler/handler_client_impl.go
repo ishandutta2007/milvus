@@ -59,7 +59,20 @@ func (hc *handlerClientImpl) GetLatestMVCCTimestampIfLocal(ctx context.Context, 
 	if err != nil {
 		return 0, err
 	}
+	if w.Channel().AccessMode != types.AccessModeRW {
+		return 0, ErrReadOnlyWAL
+	}
 	return w.GetLatestMVCCTimestamp(ctx, vchannel)
+}
+
+// GetWALMetricsIfLocal gets the metrics of the local wal.
+func (hc *handlerClientImpl) GetWALMetricsIfLocal(ctx context.Context) (*types.StreamingNodeMetrics, error) {
+	if !hc.lifetime.Add(typeutil.LifetimeStateWorking) {
+		return nil, ErrClientClosed
+	}
+	defer hc.lifetime.Done()
+
+	return registry.GetLocalWALMetrics()
 }
 
 // CreateProducer creates a producer.

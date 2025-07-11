@@ -79,6 +79,11 @@ type MutableMessage interface {
 	// !!! preserved for streaming system internal usage, don't call it outside of streaming system.
 	WithLastConfirmed(id MessageID) MutableMessage
 
+	// WithOldVersion sets the version of current message to be old version.
+	// !!! preserved for streaming system internal usage, don't call it outside of streaming system.
+	// TODO: used for old version message compatibility, will be removed in the future.
+	WithOldVersion() MutableMessage
+
 	// WithLastConfirmedUseMessageID sets the last confirmed message id of current message to be the same as message id.
 	// !!! preserved for streaming system internal usage, don't call it outside of streaming system.
 	WithLastConfirmedUseMessageID() MutableMessage
@@ -166,6 +171,9 @@ type specializedMutableMessage[H proto.Message, B proto.Message] interface {
 	// Body returns the message body.
 	// !!! Do these will trigger a unmarshal operation, so it should be used with caution.
 	Body() (B, error)
+
+	// MustBody return the message body, panic if error occurs.
+	MustBody() B
 
 	// OverwriteHeader overwrites the message header.
 	OverwriteHeader(header H)
